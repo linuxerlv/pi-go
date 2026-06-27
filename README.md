@@ -8,7 +8,7 @@ self-written pi-style unified abstraction.
 
 ## Status
 
-Implemented (M1–M5):
+Implemented (M1–M6):
 
 - **ai** — unified abstraction: `Context`, `Message` (user/assistant/toolResult),
   content blocks (text/thinking/image/toolCall), `Usage`, `Model`, `Tool`, the
@@ -24,8 +24,16 @@ Implemented (M1–M5):
   phase machine) with session persistence (in-memory and jsonl + meta sidecar),
   compaction-aware context rebuild, and union JSON (de)serialization.
 - **tools** — read, bash, write, edit, grep, glob.
+- **mcp** — minimal Model Context Protocol client over stdio; launches an MCP
+  server as a child process and exposes its tools as agent tools (a pi-go
+  addition; pi itself does not ship MCP).
+- **skills / prompt-templates** — load `SKILL.md` / `.md` files (YAML
+  frontmatter) from disk; `harness.Skill(name)` injects a skill block,
+  `harness.PromptFromTemplate(name, args)` expands positional `$1`/`$@`
+  placeholders. Available skills are listed in the system prompt.
 - **CLI** — single-prompt mode (`--prompt`), interactive REPL (multi-turn with
-  persisted session), `.env` auto-load, and `.pi-go/config.json` defaults.
+  persisted session), `.env` auto-load, `.pi-go/config.json` defaults, and
+  `--mcp` / `--skills-dir` / `--templates-dir` flags.
 
 ## Install
 
@@ -66,10 +74,17 @@ Optional `.pi-go/config.json` for defaults:
 
 # OpenAI-compatible endpoint
 ./pi --provider openai --base-url http://localhost:11434/v1 --model llama3 --prompt "..."
+
+# With an MCP server providing extra tools
+./pi --mcp "npx -y @modelcontextprotocol/server-filesystem ." --prompt "..."
+
+# Load skills and prompt templates from custom dirs
+./pi --skills-dir .skills --templates-dir .templates --session work
 ```
 
 Flags: `--prompt`, `--provider`, `--model`, `--base-url`, `--system`,
-`--session`, `--verbose`. In the REPL, `/help`, `/exit`, `/clear`.
+`--session`, `--verbose`, `--mcp`, `--skills-dir`, `--templates-dir`. In the
+REPL, `/help`, `/exit`, `/clear`.
 
 ## Layout
 
@@ -77,6 +92,7 @@ Flags: `--prompt`, `--provider`, `--model`, `--base-url`, `--system`,
 cmd/pi/           CLI entry, REPL, event rendering, .env + config loaders
 internal/ai/      unified types, EventStream, validation, provider adapters
 internal/agent/   agent loop + tool execution
-internal/harness/ AgentHarness + session (memory + jsonl) + compaction
+internal/harness/ AgentHarness + session (memory + jsonl) + compaction + skills + templates
+internal/mcp/     minimal MCP stdio client (exposes MCP tools as agent tools)
 internal/tools/   read, bash, write, edit, grep, glob
 ```

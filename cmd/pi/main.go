@@ -14,6 +14,7 @@ import (
 	"github.com/linuxerlv/pi-go/internal/ai"
 	"github.com/linuxerlv/pi-go/internal/ai/provider"
 	"github.com/linuxerlv/pi-go/internal/harness"
+	"github.com/linuxerlv/pi-go/internal/mcp"
 	"github.com/linuxerlv/pi-go/internal/tools"
 )
 
@@ -32,6 +33,9 @@ func main() {
 	system := flag.String("system", defaultSystem, "System prompt")
 	sessionID := flag.String("session", "", "Session id (enables harness mode with jsonl persistence in .pi-go/sessions/)")
 	verbose := flag.Bool("verbose", false, "Print all agent events (including tool args) to stderr")
+	mcpServers := flag.String("mcp", "", "MCP server to launch as a child process (quoted command, e.g. 'npx -y @modelcontextprotocol/server-filesystem .'). May be set multiple times via config.")
+	skillsDir := flag.String("skills-dir", ".skills", "Directory to load skills from (empty to disable)")
+	templatesDir := flag.String("templates-dir", "", "Directory to load prompt templates from (empty to disable)")
 	flag.Parse()
 
 	if *prompt == "" && flag.NArg() > 0 {
@@ -63,8 +67,27 @@ func main() {
 		tools.NewGlobTool(cwd),
 	}
 
+	// Load optional skills and prompt templates.
+	var skills []harness.Skill
+	if *skillsDir != "" {
+		skills, _ = harness.LoadSkills(*skillsDir)
+	}
+	var templates []harness.PromptTemplate
+	if *templatesDir != "" {
+		templates, _ = harness.LoadPromptTemplates(*templatesDir)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Launch optional MCP server(s) and register their tools.
+	if *mcpServers != "" {
+		mcpTools, err := loadMCPTools(ctx, *mcpServers)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[mcp warning: %v]\n", err)
+		}
+		agentTools = append(agentTools, mcpTools...)
+	}
 
 	// No prompt: interactive REPL (always harness-backed for multi-turn memory).
 	if *prompt == "" {
@@ -72,7 +95,7 @@ func main() {
 		if sid == "" {
 			sid = "default"
 		}
-		h := newHarness(sessessionsDir(), sid, *system, model, prov, agentTools)
+		h := newHarness(sessessionsDir(), sid, *system, model, prov, agentTools, skills, templates)
 		runREPL(ctx, h, *verbose)
 		return
 	}
@@ -84,7 +107,7 @@ func main() {
 
 	if *sessionID != "" {
 		// Harness mode: stateful, jsonl-persisted session.
-		runHarness(ctx, *sessionID, *prompt, *system, model, prov, agentTools, emit)
+		runHarness(ctx, *sessionID, *prompt, *system, model, prov, agentTools, skills, templates, emit)
 		return
 	}
 
@@ -112,7 +135,7 @@ func main() {
 func sessessionsDir() string { return ".pi-go/sessions" }
 
 // newHarness builds an AgentHarness backed by a jsonl session.
-func newHarness(sessionsDir, sessionID, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool) *harness.AgentHarness {
+func newHarness(sessionsDir, sessionID, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, skills []harness.Skill, templates []harness.PromptTemplate) *harness.AgentHarness {
 	storage, err := harness.NewJsonlStorage(sessionsDir, sessionID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[session error: %v]\n", err)
@@ -120,18 +143,20 @@ func newHarness(sessionsDir, sessionID, system string, model ai.Model, prov ai.P
 	}
 	sess := harness.NewSession(storage)
 	return harness.New(harness.Options{
-		Provider:     prov,
-		Model:        model,
-		SystemPrompt: system,
-		Tools:        agentTools,
-		Session:      sess,
+		Provider:        prov,
+		Model:           model,
+		SystemPrompt:    system,
+		Tools:           agentTools,
+		Session:         sess,
+		Skills:          skills,
+		PromptTemplates: templates,
 	})
 }
 
 // runHarness runs the prompt through an AgentHarness with a jsonl-persisted
 // session, so the conversation can be resumed later with the same --session id.
-func runHarness(ctx context.Context, sessionID, prompt, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, emit func(agent.AgentEvent) error) {
-	h := newHarness(sessessionsDir(), sessionID, system, model, prov, agentTools)
+func runHarness(ctx context.Context, sessionID, prompt, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, skills []harness.Skill, templates []harness.PromptTemplate, emit func(agent.AgentEvent) error) {
+	h := newHarness(sessessionsDir(), sessionID, system, model, prov, agentTools, skills, templates)
 	h.Subscribe(func(e harness.HarnessEvent) error {
 		if e.Agent != nil {
 			emit(e.Agent)
@@ -143,6 +168,60 @@ func runHarness(ctx context.Context, sessionID, prompt, system string, model ai.
 		os.Exit(1)
 	}
 	fmt.Fprintln(os.Stderr)
+}
+
+// loadMCPTools launches an MCP server (quoted command string) and returns its
+// tools as agent tools.
+func loadMCPTools(ctx context.Context, command string) ([]agent.AgentTool, error) {
+	parts, err := splitShellArgs(command)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("empty mcp command")
+	}
+	client, err := mcp.Start(ctx, parts[0], parts[1:], nil)
+	if err != nil {
+		return nil, err
+	}
+	defs, err := client.ListTools(ctx)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
+	var out []agent.AgentTool
+	for _, d := range defs {
+		out = append(out, mcp.NewMCPTool(client, d))
+	}
+	return out, nil
+}
+
+// splitShellArgs splits a command string on whitespace, honoring double quotes.
+func splitShellArgs(s string) ([]string, error) {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			inQuote = !inQuote
+		case (c == ' ' || c == '\t' || c == '\n') && !inQuote:
+			if cur.Len() > 0 {
+				out = append(out, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if inQuote {
+		return nil, fmt.Errorf("unterminated quote in command")
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out, nil
 }
 
 // resolveProvider picks the provider by name, or auto-detects from environment

@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/linuxerlv/pi-go/internal/agent"
@@ -38,6 +39,11 @@ type Options struct {
 	SystemPrompt string
 	Tools        []agent.AgentTool
 	Session      *Session
+	// Skills available for explicit Skill(name) invocation and model-visible
+	// listing in the system prompt.
+	Skills []Skill
+	// PromptTemplates available for explicit PromptFromTemplate(name, args).
+	PromptTemplates []PromptTemplate
 }
 
 // AgentHarness is a stateful wrapper around the agent loop with session
@@ -52,6 +58,8 @@ type AgentHarness struct {
 	systemPrompt  string
 	tools         []agent.AgentTool
 	session       *Session
+	skills        []Skill
+	templates     []PromptTemplate
 
 	phase   Phase
 	runCtx  context.Context
@@ -75,6 +83,8 @@ func New(opts Options) *AgentHarness {
 		systemPrompt:  opts.SystemPrompt,
 		tools:         opts.Tools,
 		session:       opts.Session,
+		skills:        opts.Skills,
+		templates:     opts.PromptTemplates,
 		phase:         PhaseIdle,
 	}
 }
@@ -179,7 +189,7 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string) ([]agent.AgentMe
 	}
 
 	agentCtx := agent.AgentContext{
-		SystemPrompt: h.systemPrompt,
+		SystemPrompt: h.effectiveSystemPrompt(),
 		Tools:        h.tools,
 		Messages:     toAgentMessages(sessCtx.Messages),
 	}
@@ -205,6 +215,73 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string) ([]agent.AgentMe
 		return newMessages, err
 	}
 	return newMessages, nil
+}
+
+// Skill invokes a named skill by injecting its content as the prompt text,
+// optionally appended with additional user instructions.
+func (h *AgentHarness) Skill(ctx context.Context, name string, additionalInstructions string) ([]agent.AgentMessage, error) {
+	skill, ok := h.findSkill(name)
+	if !ok {
+		return nil, fmt.Errorf("unknown skill: %s", name)
+	}
+	return h.Prompt(ctx, FormatSkillInvocation(skill, additionalInstructions))
+}
+
+// PromptFromTemplate invokes a named prompt template with positional arguments.
+func (h *AgentHarness) PromptFromTemplate(ctx context.Context, name string, args []string) ([]agent.AgentMessage, error) {
+	t, ok := h.findTemplate(name)
+	if !ok {
+		return nil, fmt.Errorf("unknown prompt template: %s", name)
+	}
+	return h.Prompt(ctx, FormatPromptTemplateInvocation(t, args))
+}
+
+// effectiveSystemPrompt returns the configured system prompt with a list of
+// available skills appended (those not hidden via DisableModelInvocation).
+func (h *AgentHarness) effectiveSystemPrompt() string {
+	sp := h.systemPrompt
+	var visible []Skill
+	for _, s := range h.skills {
+		if !s.DisableModelInvocation {
+			visible = append(visible, s)
+		}
+	}
+	if len(visible) == 0 {
+		return sp
+	}
+	var sb strings.Builder
+	if sp != "" {
+		sb.WriteString(sp)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("Available skills (invoke via the application's skill command):\n")
+	for _, s := range visible {
+		sb.WriteString(fmt.Sprintf("- %s", s.Name))
+		if s.Description != "" {
+			sb.WriteString(": ")
+			sb.WriteString(s.Description)
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+func (h *AgentHarness) findSkill(name string) (Skill, bool) {
+	for _, s := range h.skills {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return Skill{}, false
+}
+
+func (h *AgentHarness) findTemplate(name string) (PromptTemplate, bool) {
+	for _, t := range h.templates {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return PromptTemplate{}, false
 }
 
 // Steer enqueues a steering message to inject mid-run.
