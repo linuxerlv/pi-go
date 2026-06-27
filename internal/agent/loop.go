@@ -44,7 +44,7 @@ func RunAgentLoop(
 		emit(MessageEndEvent{Message: p})
 	}
 
-	if err := runLoop(ctx, currentContext, newMessages, config, provider, emit); err != nil {
+	if err := runLoop(ctx, currentContext, &newMessages, config, provider, emit); err != nil {
 		return newMessages, err
 	}
 	return newMessages, nil
@@ -55,7 +55,7 @@ func RunAgentLoop(
 func runLoop(
 	ctx context.Context,
 	initialContext AgentContext,
-	newMessages []AgentMessage,
+	newMessages *[]AgentMessage,
 	initialConfig AgentLoopConfig,
 	provider ai.Provider,
 	emit EventSink,
@@ -88,8 +88,8 @@ func runLoop(
 				for _, m := range pendingMessages {
 					emit(MessageStartEvent{Message: m})
 					emit(MessageEndEvent{Message: m})
-					currentContext.Messages = append(currentContext.Messages, m)
-					newMessages = append(newMessages, m)
+				currentContext.Messages = append(currentContext.Messages, m)
+				*newMessages = append(*newMessages, m)
 				}
 				pendingMessages = nil
 			}
@@ -99,11 +99,18 @@ func runLoop(
 			if err != nil {
 				return err
 			}
-			newMessages = append(newMessages, message)
+			*newMessages = append(*newMessages, message)
+			// The assistant message must be visible to the next turn's LLM
+			// call (especially when it carries tool_use blocks that the
+			// following tool_result messages reference by id). agent-loop.ts
+			// relies on JS object-reference mutation; in Go we append to the
+			// current context explicitly since streamAssistantResponse receives
+			// AgentContext by value.
+			currentContext.Messages = append(currentContext.Messages, message)
 
 			if message.StopReason == ai.StopError || message.StopReason == ai.StopAborted {
 				emit(TurnEndEvent{Message: message, ToolResults: nil})
-				emit(AgentEndEvent{Messages: newMessages})
+				emit(AgentEndEvent{Messages: *newMessages})
 				return nil
 			}
 
@@ -126,7 +133,7 @@ func runLoop(
 				hasMoreToolCalls = !batch.terminate
 				for _, r := range toolResults {
 					currentContext.Messages = append(currentContext.Messages, r)
-					newMessages = append(newMessages, r)
+					*newMessages = append(*newMessages, r)
 				}
 			}
 
@@ -138,7 +145,7 @@ func runLoop(
 					Message:     message,
 					ToolResults: toolResults,
 					Context:     currentContext,
-					NewMessages: newMessages,
+					NewMessages: *newMessages,
 				}
 				if upd := config.PrepareNextTurn(ntCtx); upd != nil {
 					if upd.Context != nil {
@@ -155,15 +162,15 @@ func runLoop(
 
 			// shouldStopAfterTurn: graceful stop before steering/followup.
 			if config.ShouldStopAfterTurn != nil {
-				if config.ShouldStopAfterTurn(ShouldStopAfterTurnContext{
-					Message:     message,
-					ToolResults: toolResults,
-					Context:     currentContext,
-					NewMessages: newMessages,
-				}) {
-					emit(AgentEndEvent{Messages: newMessages})
-					return nil
-				}
+			if config.ShouldStopAfterTurn(ShouldStopAfterTurnContext{
+				Message:     message,
+				ToolResults: toolResults,
+				Context:     currentContext,
+				NewMessages: *newMessages,
+			}) {
+				emit(AgentEndEvent{Messages: *newMessages})
+				return nil
+			}
 			}
 
 			pendingMessages = callSteering(config)
@@ -181,7 +188,7 @@ func runLoop(
 		break
 	}
 
-	emit(AgentEndEvent{Messages: newMessages})
+	emit(AgentEndEvent{Messages: *newMessages})
 	return nil
 }
 

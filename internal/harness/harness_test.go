@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -196,3 +197,90 @@ func countLines(b []byte) int {
 	}
 	return n
 }
+
+func TestCompactionAutoTriggerDropsOldMessages(t *testing.T) {
+	// First script is for the compaction summary; second is for the actual prompt.
+	prov := newMockProvider(
+		scriptTextTurn("summary of old messages"),
+		scriptTextTurn("done"),
+	)
+	sess := NewSession(NewMemoryStorage(SessionMetadata{ID: "s1", CreatedAt: nowISO()}))
+
+	// Seed 11 messages. With KeepMessages=2 and MaxMessages=10, compaction fires.
+	for i := 0; i < 11; i++ {
+		var msg ai.Message
+		if i%2 == 0 {
+			msg = ai.UserMessage{Content: fmt.Sprintf("user-%d", i), Timestamp: ai.Now()}
+		} else {
+			msg = ai.AssistantMessage{
+				Content:    []ai.ContentBlock{ai.TextContent{Type: "text", Text: fmt.Sprintf("assistant-%d", i)}},
+				Provider:   "mock",
+				Model:      "mock-model",
+				StopReason: ai.StopStop,
+				Timestamp:  ai.Now(),
+			}
+		}
+		if _, err := sess.AppendMessage(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h := New(Options{
+		Provider: prov,
+		Model:    ai.Model{ID: "mock-model", API: ai.APIAnthropicMessages, Provider: "mock"},
+		Session:  sess,
+		Compaction: &CompactionConfig{
+			Enabled:      true,
+			MaxMessages:  10,
+			KeepMessages: 2,
+		},
+	})
+
+	if _, err := h.Prompt(context.Background(), "next"); err != nil {
+		t.Fatalf("Prompt failed: %v", err)
+	}
+
+	ctx := sess.BuildContext()
+	// Expect: compaction summary + 2 kept messages + new user prompt + assistant response
+	if len(ctx.Messages) != 5 {
+		t.Fatalf("expected 5 messages after auto-compaction, got %d", len(ctx.Messages))
+	}
+	if um, ok := ctx.Messages[0].(ai.UserMessage); !ok {
+		t.Fatalf("expected compaction summary first, got %T", ctx.Messages[0])
+	} else if s, _ := um.Content.(string); s != "[compaction summary] summary of old messages" {
+		t.Fatalf("unexpected summary: %v", um.Content)
+	}
+	if _, ok := ctx.Messages[len(ctx.Messages)-1].(ai.AssistantMessage); !ok {
+		t.Fatalf("expected final assistant message, got %T", ctx.Messages[len(ctx.Messages)-1])
+	}
+}
+
+func TestCompactionDisabledDoesNotCompact(t *testing.T) {
+	prov := newMockProvider(scriptTextTurn("ok"))
+	sess := NewSession(NewMemoryStorage(SessionMetadata{ID: "s1", CreatedAt: nowISO()}))
+	for i := 0; i < 11; i++ {
+		msg := ai.UserMessage{Content: fmt.Sprintf("user-%d", i), Timestamp: ai.Now()}
+		if _, err := sess.AppendMessage(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h := New(Options{
+		Provider:   prov,
+		Model:      ai.Model{ID: "mock-model", API: ai.APIAnthropicMessages, Provider: "mock"},
+		Session:    sess,
+		Compaction: nil,
+	})
+
+	if _, err := h.Prompt(context.Background(), "next"); err != nil {
+		t.Fatalf("Prompt failed: %v", err)
+	}
+
+	ctx := sess.BuildContext()
+	// 11 existing + new user + assistant = 13, no compaction summary.
+	if len(ctx.Messages) != 13 {
+		t.Fatalf("expected 13 messages without compaction, got %d", len(ctx.Messages))
+	}
+}
+
+var _ = fmt.Sprintf

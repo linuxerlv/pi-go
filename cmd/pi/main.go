@@ -15,6 +15,7 @@ import (
 	"github.com/linuxerlv/pi-go/internal/ai/provider"
 	"github.com/linuxerlv/pi-go/internal/harness"
 	"github.com/linuxerlv/pi-go/internal/mcp"
+	"github.com/linuxerlv/pi-go/internal/orchestrator"
 	"github.com/linuxerlv/pi-go/internal/tools"
 	"github.com/linuxerlv/pi-go/internal/tui"
 )
@@ -38,6 +39,9 @@ func main() {
 	skillsDir := flag.String("skills-dir", ".skills", "Directory to load skills from (empty to disable)")
 	templatesDir := flag.String("templates-dir", "", "Directory to load prompt templates from (empty to disable)")
 	useTUI := flag.Bool("tui", false, "Use differential-rendered TUI view instead of streaming print")
+	orchestrate := flag.Bool("orchestrate", false, "Use multi-agent orchestrator (decomposes the prompt into subtasks)")
+	strategy := flag.String("strategy", "sequential", "Orchestrator strategy: sequential | parallel")
+	maxAgents := flag.Int("max-agents", 4, "Maximum concurrent subtask agents (parallel strategy)")
 	flag.Parse()
 
 	if *prompt == "" && flag.NArg() > 0 {
@@ -99,6 +103,13 @@ func main() {
 		}
 		h := newHarness(sessessionsDir(), sid, *system, model, prov, agentTools, skills, templates)
 		runREPL(ctx, h, *verbose)
+		return
+	}
+
+	// Orchestrator mode: break the prompt into subtasks and delegate to
+	// multiple agent runs with optional parallel execution.
+	if *orchestrate {
+		runOrchestrator(ctx, *prompt, *system, *strategy, *maxAgents, model, prov, agentTools, *verbose)
 		return
 	}
 
@@ -190,8 +201,47 @@ func runHarness(ctx context.Context, sessionID, prompt, system string, model ai.
 	fmt.Fprintln(os.Stderr)
 }
 
-// loadMCPTools launches an MCP server (quoted command string) and returns its
-// tools as agent tools.
+// runOrchestrator runs the prompt through the multi-agent orchestrator.
+func runOrchestrator(ctx context.Context, prompt, system, strategyName string, maxAgents int, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, verbose bool) {
+	var strat orchestrator.Strategy
+	switch strategyName {
+	case "parallel":
+		strat = &orchestrator.ParallelStrategy{MaxConcurrency: maxAgents}
+	default:
+		strat = &orchestrator.SequentialStrategy{}
+	}
+
+	orch := orchestrator.New(orchestrator.Options{
+		Provider:     prov,
+		Model:        model,
+		SystemPrompt: system,
+		Tools:        agentTools,
+		Strategy:     strat,
+	})
+
+	fmt.Fprintf(os.Stderr, "[orchestrator] planning subtasks...\n")
+	result, err := orch.Run(ctx, prompt)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[orchestrator error: %v]\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "\n=== Orchestrator Result ===\n")
+	fmt.Fprintf(os.Stderr, "Task: %s\n", result.Task)
+	fmt.Fprintf(os.Stderr, "Subtasks: %d\n\n", len(result.SubTasks))
+	for i, st := range result.SubTasks {
+		fmt.Fprintf(os.Stderr, "--- Subtask %d: %s ---\n", i+1, st.ID)
+		if verbose {
+			fmt.Fprintf(os.Stderr, "%s\n", st.Description)
+			if i < len(result.Results) {
+				fmt.Fprintf(os.Stderr, "Result: %s\n", result.Results[i].Output)
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "\nFinal Answer:\n%s\n", result.FinalAnswer)
+}
+
+// loadMCPTools launches an MCP server (quoted string) and returns its tools.
 func loadMCPTools(ctx context.Context, command string) ([]agent.AgentTool, error) {
 	parts, err := splitShellArgs(command)
 	if err != nil {

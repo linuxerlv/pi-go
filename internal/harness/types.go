@@ -106,6 +106,30 @@ type ModelRef struct {
 	ModelID  string
 }
 
+// CompactionConfig configures automatic context compaction for an
+// AgentHarness. When the visible conversation exceeds the configured limits,
+// the harness asks the model to summarize the oldest messages and stores a
+// CompactionEntry so future context rebuilds drop those messages.
+type CompactionConfig struct {
+	// Enabled turns automatic compaction on. Manual compaction can still be
+	// performed by writing CompactionEntry directly into session storage.
+	Enabled bool
+	// MaxMessages triggers compaction when the number of visible messages
+	// exceeds this value. Zero disables the message-count trigger.
+	MaxMessages int
+	// MaxTokens triggers compaction when the estimated token count exceeds
+	// this value. Zero disables the token trigger.
+	MaxTokens int
+	// KeepMessages is how many of the most recent messages to retain after
+	// compaction. Must be >= 2 to keep a user/assistant pair. Defaults to 10.
+	KeepMessages int
+	// SummaryModel is the model used to generate the summary. If nil, the
+	// harness's active model is used.
+	SummaryModel *ai.Model
+	// SummaryPrompt overrides the default compaction summary prompt.
+	SummaryPrompt string
+}
+
 // SessionMetadata is the per-session metadata.
 type SessionMetadata struct {
 	ID        string `json:"id"`
