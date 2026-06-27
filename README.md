@@ -13,10 +13,10 @@ Implemented (M1–M6):
 - **ai** — unified abstraction: `Context`, `Message` (user/assistant/toolResult),
   content blocks (text/thinking/image/toolCall), `Usage`, `Model`, `Tool`, the
   streaming `AssistantMessageEvent` protocol, and an `EventStream` primitive.
-- **provider** — `Anthropic` (Messages API) and `OpenAI` (Chat Completions,
-  OpenAI-compatible via `option.WithBaseURL`). Both translate vendor stream
-  events into the pi protocol and harden against gateways that omit stream-stop
-  events.
+- **provider** — `Anthropic` (Messages API), `OpenAI` (Chat Completions), and
+  `OpenAIResponses` (Responses API). The OpenAI providers are OpenAI-compatible
+  via `option.WithBaseURL`. All translate vendor stream events into the pi
+  protocol and harden against gateways that omit stream-stop events.
 - **agent** — the agent loop: `runLoop` (turns + follow-ups), tool execution
   (sequential / parallel), before/after-tool hooks, steering/follow-up queues,
   context transform, abort via `context.Context`.
@@ -27,13 +27,17 @@ Implemented (M1–M6):
 - **mcp** — minimal Model Context Protocol client over stdio; launches an MCP
   server as a child process and exposes its tools as agent tools (a pi-go
   addition; pi itself does not ship MCP).
+- **tui** — differential-rendered terminal view: keeps the previous frame and
+  only rewrites changed rows, avoiding full-screen flicker. A small,
+  dependency-free analogue of pi-tui's renderer.
 - **skills / prompt-templates** — load `SKILL.md` / `.md` files (YAML
   frontmatter) from disk; `harness.Skill(name)` injects a skill block,
   `harness.PromptFromTemplate(name, args)` expands positional `$1`/`$@`
   placeholders. Available skills are listed in the system prompt.
 - **CLI** — single-prompt mode (`--prompt`), interactive REPL (multi-turn with
-  persisted session), `.env` auto-load, `.pi-go/config.json` defaults, and
-  `--mcp` / `--skills-dir` / `--templates-dir` flags.
+  persisted session), `--tui` differential view, `.env` auto-load,
+  `.pi-go/config.json` defaults, and `--mcp` / `--skills-dir` /
+  `--templates-dir` flags.
 
 ## Install
 
@@ -75,6 +79,12 @@ Optional `.pi-go/config.json` for defaults:
 # OpenAI-compatible endpoint
 ./pi --provider openai --base-url http://localhost:11434/v1 --model llama3 --prompt "..."
 
+# OpenAI Responses API
+./pi --provider openai-responses --model gpt-4o --prompt "..."
+
+# Differential-rendered TUI view
+./pi --tui --prompt "..."
+
 # With an MCP server providing extra tools
 ./pi --mcp "npx -y @modelcontextprotocol/server-filesystem ." --prompt "..."
 
@@ -83,8 +93,8 @@ Optional `.pi-go/config.json` for defaults:
 ```
 
 Flags: `--prompt`, `--provider`, `--model`, `--base-url`, `--system`,
-`--session`, `--verbose`, `--mcp`, `--skills-dir`, `--templates-dir`. In the
-REPL, `/help`, `/exit`, `/clear`.
+`--session`, `--verbose`, `--tui`, `--mcp`, `--skills-dir`, `--templates-dir`.
+In the REPL, `/help`, `/exit`, `/clear`.
 
 ## Layout
 
@@ -95,4 +105,5 @@ internal/agent/   agent loop + tool execution
 internal/harness/ AgentHarness + session (memory + jsonl) + compaction + skills + templates
 internal/mcp/     minimal MCP stdio client (exposes MCP tools as agent tools)
 internal/tools/   read, bash, write, edit, grep, glob
+internal/tui/     differential-rendered terminal view
 ```

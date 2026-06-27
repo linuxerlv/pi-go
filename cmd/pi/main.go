@@ -16,6 +16,7 @@ import (
 	"github.com/linuxerlv/pi-go/internal/harness"
 	"github.com/linuxerlv/pi-go/internal/mcp"
 	"github.com/linuxerlv/pi-go/internal/tools"
+	"github.com/linuxerlv/pi-go/internal/tui"
 )
 
 func main() {
@@ -36,6 +37,7 @@ func main() {
 	mcpServers := flag.String("mcp", "", "MCP server to launch as a child process (quoted command, e.g. 'npx -y @modelcontextprotocol/server-filesystem .'). May be set multiple times via config.")
 	skillsDir := flag.String("skills-dir", ".skills", "Directory to load skills from (empty to disable)")
 	templatesDir := flag.String("templates-dir", "", "Directory to load prompt templates from (empty to disable)")
+	useTUI := flag.Bool("tui", false, "Use differential-rendered TUI view instead of streaming print")
 	flag.Parse()
 
 	if *prompt == "" && flag.NArg() > 0 {
@@ -100,9 +102,27 @@ func main() {
 		return
 	}
 
+	// Set up the event emitter. --tui uses a differential-rendered view; the
+	// default streams events to stdout/stderr.
+	var view *tui.AgentView
+	if *useTUI {
+		term := tui.NewTerminal(os.Stdout)
+		view = tui.NewAgentView(term, "pi-go")
+		view.Start()
+	}
 	emit := func(ev agent.AgentEvent) error {
-		printEvent(ev, *verbose)
+		if view != nil {
+			view.HandleEvent(ev)
+		} else {
+			printEvent(ev, *verbose)
+		}
 		return nil
+	}
+	if *useTUI {
+		defer func() {
+			view.Stop()
+			fmt.Fprintln(os.Stderr)
+		}()
 	}
 
 	if *sessionID != "" {
@@ -247,10 +267,7 @@ func resolveProvider(name, baseURL string) (ai.Provider, string, error) {
 		}
 		return prov, "claude-haiku-4-5", nil
 	case "openai":
-		apiKey := os.Getenv("OPENAI_API_KEY")
-		if apiKey == "" {
-			apiKey = os.Getenv("OPENAI_AUTH_TOKEN")
-		}
+		apiKey := openAIKeyFromEnv()
 		if apiKey == "" {
 			return nil, "", fmt.Errorf("OPENAI_API_KEY (or OPENAI_AUTH_TOKEN) is not set")
 		}
@@ -260,8 +277,19 @@ func resolveProvider(name, baseURL string) (ai.Provider, string, error) {
 		}
 		prov := provider.NewOpenAI(apiKey, url)
 		return prov, "gpt-4o-mini", nil
+	case "openai-responses":
+		apiKey := openAIKeyFromEnv()
+		if apiKey == "" {
+			return nil, "", fmt.Errorf("OPENAI_API_KEY (or OPENAI_AUTH_TOKEN) is not set")
+		}
+		url := baseURL
+		if url == "" {
+			url = os.Getenv("OPENAI_BASE_URL")
+		}
+		prov := provider.NewOpenAIResponses(apiKey, url)
+		return prov, "gpt-4o-mini", nil
 	}
-	return nil, "", fmt.Errorf("unknown provider: %s (use anthropic or openai)", name)
+	return nil, "", fmt.Errorf("unknown provider: %s (use anthropic, openai, or openai-responses)", name)
 }
 
 // registerDynamicModel adds an unknown model id to the provider so the agent
@@ -276,6 +304,20 @@ func registerDynamicModel(prov ai.Provider, id string) ai.Model {
 		m := ai.Model{ID: id, Name: id, API: ai.APIOpenAICompletions, Provider: "openai", ContextWindow: 128_000, MaxTokens: 16_384, Input: []string{"text", "image"}}
 		p.RegisterModel(m)
 		return m
+	case *provider.OpenAIResponses:
+		m := ai.Model{ID: id, Name: id, API: ai.APIOpenAIResponses, Provider: "openai-responses", ContextWindow: 128_000, MaxTokens: 16_384, Input: []string{"text", "image"}}
+		p.RegisterModel(m)
+		return m
 	}
 	return ai.Model{ID: id, Name: id}
+}
+
+// openAIKeyFromEnv returns the OpenAI API key from OPENAI_API_KEY, falling back
+// to OPENAI_AUTH_TOKEN.
+func openAIKeyFromEnv() string {
+	k := os.Getenv("OPENAI_API_KEY")
+	if k == "" {
+		k = os.Getenv("OPENAI_AUTH_TOKEN")
+	}
+	return k
 }
