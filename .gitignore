@@ -1,0 +1,21 @@
+# Secrets / local config
+.env
+.env.*
+
+# Sessions / runtime artifacts
+.pi-go/
+
+# Claude Code local settings
+.claude/
+
+# Go build output
+*.exe
+*.exe~
+*.test
+*.out
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
