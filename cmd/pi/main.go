@@ -19,22 +19,23 @@ import (
 
 func main() {
 	loadDotEnv(".env")
+	cfg := loadConfig(defaultConfigPath())
 
 	prompt := flag.String("prompt", "", "Prompt to send to the model")
-	modelID := flag.String("model", "", "Model id (default depends on provider)")
-	provName := flag.String("provider", "", "Provider: anthropic | openai (auto-detected from env if empty)")
-	baseURL := flag.String("base-url", "", "Override provider base URL (for OpenAI-compatible endpoints)")
-	system := flag.String("system", "You are a helpful coding agent. Use the read and bash tools to answer questions about the user's codebase. Be concise.", "System prompt")
+	modelID := flag.String("model", cfg.Model, "Model id (default depends on provider or config)")
+	provName := flag.String("provider", cfg.Provider, "Provider: anthropic | openai (auto-detected from env if empty)")
+	baseURL := flag.String("base-url", cfg.BaseURL, "Override provider base URL (for OpenAI-compatible endpoints)")
+	defaultSystem := "You are a helpful coding agent. Use the read, bash, edit, write, grep, and glob tools to answer questions about the user's codebase. Be concise."
+	if cfg.SystemPrompt != "" {
+		defaultSystem = cfg.SystemPrompt
+	}
+	system := flag.String("system", defaultSystem, "System prompt")
 	sessionID := flag.String("session", "", "Session id (enables harness mode with jsonl persistence in .pi-go/sessions/)")
 	verbose := flag.Bool("verbose", false, "Print all agent events (including tool args) to stderr")
 	flag.Parse()
 
 	if *prompt == "" && flag.NArg() > 0 {
 		*prompt = strings.Join(flag.Args(), " ")
-	}
-	if *prompt == "" {
-		fmt.Fprintln(os.Stderr, `usage: pi --prompt "..." [--provider anthropic|openai] [--model ...] [--base-url ...]`)
-		os.Exit(2)
 	}
 
 	prov, defaultModel, err := resolveProvider(*provName, *baseURL)
@@ -56,10 +57,25 @@ func main() {
 	agentTools := []agent.AgentTool{
 		tools.NewReadTool(cwd),
 		tools.NewBashTool(cwd),
+		tools.NewWriteTool(cwd),
+		tools.NewEditTool(cwd),
+		tools.NewGrepTool(cwd),
+		tools.NewGlobTool(cwd),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// No prompt: interactive REPL (always harness-backed for multi-turn memory).
+	if *prompt == "" {
+		sid := *sessionID
+		if sid == "" {
+			sid = "default"
+		}
+		h := newHarness(sessessionsDir(), sid, *system, model, prov, agentTools)
+		runREPL(ctx, h, *verbose)
+		return
+	}
 
 	emit := func(ev agent.AgentEvent) error {
 		printEvent(ev, *verbose)
@@ -92,23 +108,30 @@ func main() {
 	fmt.Fprintln(os.Stderr)
 }
 
-// runHarness runs the prompt through an AgentHarness with a jsonl-persisted
-// session, so the conversation can be resumed later with the same --session id.
-func runHarness(ctx context.Context, sessionID, prompt, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, emit func(agent.AgentEvent) error) {
-	sessionsDir := ".pi-go/sessions"
+// sessessionsDir is the directory for jsonl session files.
+func sessessionsDir() string { return ".pi-go/sessions" }
+
+// newHarness builds an AgentHarness backed by a jsonl session.
+func newHarness(sessionsDir, sessionID, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool) *harness.AgentHarness {
 	storage, err := harness.NewJsonlStorage(sessionsDir, sessionID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\n[session error: %v]\n", err)
+		fmt.Fprintf(os.Stderr, "[session error: %v]\n", err)
 		os.Exit(1)
 	}
 	sess := harness.NewSession(storage)
-	h := harness.New(harness.Options{
+	return harness.New(harness.Options{
 		Provider:     prov,
 		Model:        model,
 		SystemPrompt: system,
 		Tools:        agentTools,
 		Session:      sess,
 	})
+}
+
+// runHarness runs the prompt through an AgentHarness with a jsonl-persisted
+// session, so the conversation can be resumed later with the same --session id.
+func runHarness(ctx context.Context, sessionID, prompt, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, emit func(agent.AgentEvent) error) {
+	h := newHarness(sessessionsDir(), sessionID, system, model, prov, agentTools)
 	h.Subscribe(func(e harness.HarnessEvent) error {
 		if e.Agent != nil {
 			emit(e.Agent)
