@@ -37,7 +37,6 @@ var globSchema = map[string]any{
 // GlobTool lists files matching a glob pattern.
 type GlobTool struct {
 	BaseTool
-	Cwd string
 }
 
 // NewGlobTool constructs a GlobTool anchored at cwd.
@@ -50,8 +49,8 @@ func NewGlobTool(cwd string) *GlobTool {
 				Parameters:  globSchema,
 			},
 			ToolLabel: "Glob",
+			Cwd:       cwd,
 		},
-		Cwd: cwd,
 	}
 }
 
@@ -65,9 +64,7 @@ func (t *GlobTool) Execute(ctx context.Context, toolCallID string, params map[st
 	if searchDir == "" {
 		searchDir = t.Cwd
 	}
-	if !filepath.IsAbs(searchDir) {
-		searchDir = filepath.Join(t.Cwd, searchDir)
-	}
+	searchDir = t.resolvePath(searchDir)
 	limit := globDefaultLimit
 	if v, ok := params["limit"]; ok {
 		if n, err := toInt(v); err == nil && n > 0 {

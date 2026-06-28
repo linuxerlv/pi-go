@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/linuxerlv/pi-go/internal/agent"
@@ -47,7 +46,6 @@ var editSchema = map[string]any{
 // the original content (not incrementally).
 type EditTool struct {
 	BaseTool
-	Cwd string
 }
 
 // NewEditTool constructs an EditTool anchored at cwd.
@@ -60,16 +58,16 @@ func NewEditTool(cwd string) *EditTool {
 				Parameters:  editSchema,
 			},
 			ToolLabel: "Edit",
+			Cwd:       cwd,
 		},
-		Cwd: cwd,
 	}
 }
 
 // Execute runs the edit tool.
 func (t *EditTool) Execute(ctx context.Context, toolCallID string, params map[string]any, onUpdate agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return agent.AgentToolResult{}, fmt.Errorf("path is required")
+	path, err := pathParam(params)
+	if err != nil {
+		return agent.AgentToolResult{}, err
 	}
 	editsAny, _ := params["edits"].([]any)
 	if len(editsAny) == 0 {
@@ -91,10 +89,7 @@ func (t *EditTool) Execute(ctx context.Context, toolCallID string, params map[st
 		edits = append(edits, edit{oldText, newText})
 	}
 
-	abs := path
-	if !filepath.IsAbs(path) {
-		abs = filepath.Join(t.Cwd, path)
-	}
+	abs := t.resolvePath(path)
 	original, err := os.ReadFile(abs)
 	if err != nil {
 		return agent.AgentToolResult{}, err

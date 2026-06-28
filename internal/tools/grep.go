@@ -32,7 +32,6 @@ var grepSchema = map[string]any{
 // GrepTool searches file contents for a pattern (regex or literal).
 type GrepTool struct {
 	BaseTool
-	Cwd string
 }
 
 // NewGrepTool constructs a GrepTool anchored at cwd.
@@ -45,8 +44,8 @@ func NewGrepTool(cwd string) *GrepTool {
 				Parameters:  grepSchema,
 			},
 			ToolLabel: "Grep",
+			Cwd:       cwd,
 		},
-		Cwd: cwd,
 	}
 }
 
@@ -60,9 +59,7 @@ func (t *GrepTool) Execute(ctx context.Context, toolCallID string, params map[st
 	if searchPath == "" {
 		searchPath = "."
 	}
-	if !filepath.IsAbs(searchPath) {
-		searchPath = filepath.Join(t.Cwd, searchPath)
-	}
+	searchPath = t.resolvePath(searchPath)
 	globPattern, _ := params["glob"].(string)
 	ignoreCase, _ := params["ignoreCase"].(bool)
 	literal, _ := params["literal"].(bool)

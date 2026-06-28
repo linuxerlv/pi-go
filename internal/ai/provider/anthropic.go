@@ -98,55 +98,18 @@ func (a *Anthropic) StreamSimple(ctx context.Context, model ai.Model, context ai
 	return stream
 }
 
-func (a *Anthropic) runStream(ctx context.Context, model ai.Model, context ai.Context, options *ai.SimpleStreamOptions, stream ai.AssistantMessageEventStream) {
-	params, err := buildAnthropicParams(model, context, options)
-	if err != nil {
-		stream.Push(ai.ErrorEvent{
-			Reason: ai.StopError,
-			Error:  failureMessage(model, err.Error(), false),
-		})
-		return
-	}
-
-	sdkStream := a.client.Messages.NewStreaming(ctx, params)
-	translator := newAnthropicTranslator(model)
-
-	for sdkStream.Next() {
-		ev := sdkStream.Current()
-		if ctx.Err() != nil {
-			stream.Push(ai.ErrorEvent{
-				Reason: ai.StopAborted,
-				Error:  failureMessage(model, "Operation aborted", true),
-			})
-			return
-		}
-		translator.handle(ev, stream)
-	}
-	if err := sdkStream.Err(); err != nil {
-		reason := ai.StopError
-		aborted := false
-		if ctx.Err() != nil {
-			reason = ai.StopAborted
-			aborted = true
-		}
-		stream.Push(ai.ErrorEvent{
-			Reason: reason,
-			Error:  failureMessage(model, err.Error(), aborted),
-		})
-		return
-	}
-	// If the translator never emitted a terminal event (e.g. the gateway does
-	// not send message_stop/content_block_stop), synthesize one from the
-	// accumulated partial. Finalize any tool-call blocks whose argument JSON
-	// was streamed but never decoded (no content_block_stop).
-	if !translator.terminalEmitted {
-		translator.finalizeToolBlocks(stream)
-		msg := translator.snapshot()
-		if msg.StopReason == "" {
-			msg.StopReason = ai.StopStop
-		}
-		stream.Push(ai.DoneEvent{Reason: msg.StopReason, Message: msg})
-	}
+func (a *Anthropic) runStream(ctx context.Context, model ai.Model, callCtx ai.Context, options *ai.SimpleStreamOptions, stream ai.AssistantMessageEventStream) {
+	runStreamCommon(ctx, model, callCtx, options, stream,
+		func(m ai.Model, c ai.Context, o *ai.SimpleStreamOptions) (any, error) {
+			return buildAnthropicParams(m, c, o)
+		},
+		func(m ai.Model) translator { return newAnthropicTranslator(m) },
+		func(ctx context.Context, params any) streamSource {
+			s := a.client.Messages.NewStreaming(ctx, params.(anthropic.MessageNewParams))
+			return newSSEAdapter(s.Next, s.Current, s.Err)
+		},
+		failureMessage,
+	)
 }
 
 // anthropicTranslator accumulates streaming events into a partial
@@ -157,7 +120,7 @@ type anthropicTranslator struct {
 	blocks          []ai.ContentBlock // accumulated content blocks (parallel to partial.Content)
 	blockStarted    map[int]bool
 	deltaSeen       map[int]bool
-	terminalEmitted bool
+	terminalEmittedField bool
 }
 
 func newAnthropicTranslator(model ai.Model) *anthropicTranslator {
@@ -198,13 +161,23 @@ func (t *anthropicTranslator) finalizeToolBlocks(stream ai.AssistantMessageEvent
 // snapshot returns a copy of the current partial with its content set from the
 // accumulated blocks.
 func (t *anthropicTranslator) snapshot() ai.AssistantMessage {
-	msg := t.partial
-	msg.Content = append([]ai.ContentBlock(nil), t.blocks...)
-	return msg
+	return snapshotBase(t.partial, t.blocks)
 }
 
-func (t *anthropicTranslator) handle(ev anthropic.MessageStreamEventUnion, stream ai.AssistantMessageEventStream) {
-	if t.terminalEmitted {
+// finalize satisfies the translator interface; anthropic decodes any tool-call
+// args that were streamed but never finalized (gateways omitting stop events).
+func (t *anthropicTranslator) finalize(stream ai.AssistantMessageEventStream) {
+	t.finalizeToolBlocks(stream)
+}
+
+func (t *anthropicTranslator) terminalEmitted() bool { return t.terminalEmittedField }
+
+func (t *anthropicTranslator) handle(event any, stream ai.AssistantMessageEventStream) {
+	ev, ok := event.(anthropic.MessageStreamEventUnion)
+	if !ok {
+		return
+	}
+	if t.terminalEmittedField {
 		return
 	}
 	switch ev.Type {
@@ -319,7 +292,7 @@ func (t *anthropicTranslator) handle(ev anthropic.MessageStreamEventUnion, strea
 		if msg.StopReason == "" {
 			msg.StopReason = ai.StopStop
 		}
-		t.terminalEmitted = true
+		t.terminalEmittedField = true
 		stream.Push(ai.DoneEvent{Reason: msg.StopReason, Message: msg})
 	}
 }

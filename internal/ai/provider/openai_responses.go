@@ -84,46 +84,18 @@ func (p *OpenAIResponses) StreamSimple(ctx context.Context, model ai.Model, cont
 	return stream
 }
 
-func (p *OpenAIResponses) runStream(ctx context.Context, model ai.Model, context ai.Context, options *ai.SimpleStreamOptions, stream ai.AssistantMessageEventStream) {
-	params, err := buildResponsesParams(model, context, options)
-	if err != nil {
-		stream.Push(ai.ErrorEvent{Reason: ai.StopError, Error: openAIFailureMessage(model, err.Error(), false)})
-		return
-	}
-	sdkStream := p.client.Responses.NewStreaming(ctx, params)
-	tr := newResponsesTranslator(model)
-	started := false
-
-	for sdkStream.Next() {
-		if ctx.Err() != nil {
-			stream.Push(ai.ErrorEvent{Reason: ai.StopAborted, Error: openAIFailureMessage(model, "Operation aborted", true)})
-			return
-		}
-		ev := sdkStream.Current()
-		if !started {
-			started = true
-			stream.Push(ai.StartEvent{Partial: tr.snapshot()})
-		}
-		tr.handle(ev, stream)
-	}
-	if err := sdkStream.Err(); err != nil {
-		reason := ai.StopError
-		aborted := false
-		if ctx.Err() != nil {
-			reason = ai.StopAborted
-			aborted = true
-		}
-		stream.Push(ai.ErrorEvent{Reason: reason, Error: openAIFailureMessage(model, err.Error(), aborted)})
-		return
-	}
-	tr.finalize(stream)
-	if !tr.terminalEmitted {
-		msg := tr.snapshot()
-		if msg.StopReason == "" {
-			msg.StopReason = ai.StopStop
-		}
-		stream.Push(ai.DoneEvent{Reason: msg.StopReason, Message: msg})
-	}
+func (p *OpenAIResponses) runStream(ctx context.Context, model ai.Model, callCtx ai.Context, options *ai.SimpleStreamOptions, stream ai.AssistantMessageEventStream) {
+	runStreamCommon(ctx, model, callCtx, options, stream,
+		func(m ai.Model, c ai.Context, o *ai.SimpleStreamOptions) (any, error) {
+			return buildResponsesParams(m, c, o)
+		},
+		func(m ai.Model) translator { return newResponsesTranslator(m) },
+		func(ctx context.Context, params any) streamSource {
+			s := p.client.Responses.NewStreaming(ctx, params.(responses.ResponseNewParams))
+			return newSSEAdapter(s.Next, s.Current, s.Err)
+		},
+		openAIFailureMessage,
+	)
 }
 
 // responsesTranslator accumulates Responses stream events into a partial
@@ -133,12 +105,13 @@ type responsesTranslator struct {
 	model           ai.Model
 	partial         ai.AssistantMessage
 	blocks          []ai.ContentBlock
+	started         bool
 	textStarted     bool
 	// tool calls indexed by output index (the Responses API assigns each
 	// function_call item an output_index).
 	toolCalls      map[int]*ai.ToolCall
 	toolOrder      []int
-	terminalEmitted bool
+	terminalEmittedField bool
 }
 
 func newResponsesTranslator(model ai.Model) *responsesTranslator {
@@ -155,14 +128,22 @@ func newResponsesTranslator(model ai.Model) *responsesTranslator {
 }
 
 func (t *responsesTranslator) snapshot() ai.AssistantMessage {
-	msg := t.partial
-	msg.Content = append([]ai.ContentBlock(nil), t.blocks...)
-	return msg
+	return snapshotBase(t.partial, t.blocks)
 }
 
-func (t *responsesTranslator) handle(ev responses.ResponseStreamEventUnion, stream ai.AssistantMessageEventStream) {
-	if t.terminalEmitted {
+func (t *responsesTranslator) terminalEmitted() bool { return t.terminalEmittedField }
+
+func (t *responsesTranslator) handle(event any, stream ai.AssistantMessageEventStream) {
+	ev, ok := event.(responses.ResponseStreamEventUnion)
+	if !ok {
 		return
+	}
+	if t.terminalEmittedField {
+		return
+	}
+	if !t.started {
+		t.started = true
+		stream.Push(ai.StartEvent{Partial: t.snapshot()})
 	}
 	switch ev.Type {
 	case "response.output_text.delta":
@@ -238,7 +219,7 @@ func (t *responsesTranslator) handle(ev responses.ResponseStreamEventUnion, stre
 		m := t.snapshot()
 		m.StopReason = ai.StopError
 		m.ErrorMessage = msg
-		t.terminalEmitted = true
+		t.terminalEmittedField = true
 		stream.Push(ai.ErrorEvent{Reason: ai.StopError, Error: m})
 	}
 }

@@ -29,7 +29,6 @@ var writeSchema = map[string]any{
 // WriteTool writes content to a file, creating parent directories as needed.
 type WriteTool struct {
 	BaseTool
-	Cwd string
 }
 
 // NewWriteTool constructs a WriteTool anchored at cwd.
@@ -42,23 +41,19 @@ func NewWriteTool(cwd string) *WriteTool {
 				Parameters:  writeSchema,
 			},
 			ToolLabel: "Write",
+			Cwd:       cwd,
 		},
-		Cwd: cwd,
 	}
 }
 
 // Execute runs the write tool.
 func (t *WriteTool) Execute(ctx context.Context, toolCallID string, params map[string]any, onUpdate agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
-	path, _ := params["path"].(string)
+	path, err := pathParam(params)
+	if err != nil {
+		return agent.AgentToolResult{}, err
+	}
 	content, _ := params["content"].(string)
-	if path == "" {
-		return agent.AgentToolResult{}, fmt.Errorf("path is required")
-	}
-
-	abs := path
-	if !filepath.IsAbs(path) {
-		abs = filepath.Join(t.Cwd, path)
-	}
+	abs := t.resolvePath(path)
 	dir := filepath.Dir(abs)
 	if dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -70,8 +65,8 @@ func (t *WriteTool) Execute(ctx context.Context, toolCallID string, params map[s
 	}
 
 	written := len(content)
-	return agent.AgentToolResult{
-		Content: []ai.ContentBlock{ai.TextContent{Type: "text", Text: fmt.Sprintf("Wrote %d bytes to %s", written, path)}},
-		Details: map[string]any{"path": path, "bytes": written},
-	}, nil
+	return textResultWithDetails(
+		fmt.Sprintf("Wrote %d bytes to %s", written, path),
+		map[string]any{"path": path, "bytes": written},
+	), nil
 }

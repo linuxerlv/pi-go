@@ -98,50 +98,18 @@ func (p *OpenAI) StreamSimple(ctx context.Context, model ai.Model, context ai.Co
 	return stream
 }
 
-func (p *OpenAI) runStream(ctx context.Context, model ai.Model, context ai.Context, options *ai.SimpleStreamOptions, stream ai.AssistantMessageEventStream) {
-	params, err := buildOpenAIParams(model, context, options)
-	if err != nil {
-		stream.Push(ai.ErrorEvent{Reason: ai.StopError, Error: openAIFailureMessage(model, err.Error(), false)})
-		return
-	}
-
-	sdkStream := p.client.Chat.Completions.NewStreaming(ctx, params)
-	tr := newOpenAITranslator(model)
-	started := false
-
-	for sdkStream.Next() {
-		if ctx.Err() != nil {
-			stream.Push(ai.ErrorEvent{Reason: ai.StopAborted, Error: openAIFailureMessage(model, "Operation aborted", true)})
-			return
-		}
-		chunk := sdkStream.Current()
-		if !started {
-			started = true
-			stream.Push(ai.StartEvent{Partial: tr.snapshot()})
-		}
-		tr.handle(chunk, stream)
-	}
-	if err := sdkStream.Err(); err != nil {
-		reason := ai.StopError
-		aborted := false
-		if ctx.Err() != nil {
-			reason = ai.StopAborted
-			aborted = true
-		}
-		stream.Push(ai.ErrorEvent{Reason: reason, Error: openAIFailureMessage(model, err.Error(), aborted)})
-		return
-	}
-
-	// Finalize any tool-call arguments accumulated from streamed fragments, then
-	// emit a terminal event if the stream did not already carry one.
-	tr.finalize(stream)
-	if !tr.terminalEmitted {
-		msg := tr.snapshot()
-		if msg.StopReason == "" {
-			msg.StopReason = ai.StopStop
-		}
-		stream.Push(ai.DoneEvent{Reason: msg.StopReason, Message: msg})
-	}
+func (p *OpenAI) runStream(ctx context.Context, model ai.Model, callCtx ai.Context, options *ai.SimpleStreamOptions, stream ai.AssistantMessageEventStream) {
+	runStreamCommon(ctx, model, callCtx, options, stream,
+		func(m ai.Model, c ai.Context, o *ai.SimpleStreamOptions) (any, error) {
+			return buildOpenAIParams(m, c, o)
+		},
+		func(m ai.Model) translator { return newOpenAITranslator(m) },
+		func(ctx context.Context, params any) streamSource {
+			s := p.client.Chat.Completions.NewStreaming(ctx, params.(openai.ChatCompletionNewParams))
+			return newSSEAdapter(s.Next, s.Current, s.Err)
+		},
+		openAIFailureMessage,
+	)
 }
 
 // openAITranslator accumulates Chat Completion chunks into a partial
@@ -151,10 +119,11 @@ type openAITranslator struct {
 	model           ai.Model
 	partial         ai.AssistantMessage
 	blocks          []ai.ContentBlock
+	started         bool
 	textStarted     bool
 	toolCalls       map[int]*ai.ToolCall // by OpenAI tool-call index
 	toolOrder       []int                // indices in arrival order
-	terminalEmitted bool
+	terminalEmittedField bool
 }
 
 func newOpenAITranslator(model ai.Model) *openAITranslator {
@@ -171,14 +140,22 @@ func newOpenAITranslator(model ai.Model) *openAITranslator {
 }
 
 func (t *openAITranslator) snapshot() ai.AssistantMessage {
-	msg := t.partial
-	msg.Content = append([]ai.ContentBlock(nil), t.blocks...)
-	return msg
+	return snapshotBase(t.partial, t.blocks)
 }
 
-func (t *openAITranslator) handle(chunk openai.ChatCompletionChunk, stream ai.AssistantMessageEventStream) {
-	if t.terminalEmitted {
+func (t *openAITranslator) terminalEmitted() bool { return t.terminalEmittedField }
+
+func (t *openAITranslator) handle(event any, stream ai.AssistantMessageEventStream) {
+	chunk, ok := event.(openai.ChatCompletionChunk)
+	if !ok {
 		return
+	}
+	if t.terminalEmittedField {
+		return
+	}
+	if !t.started {
+		t.started = true
+		stream.Push(ai.StartEvent{Partial: t.snapshot()})
 	}
 	// Usage (when stream_options.include_usage is set, arrives on the final
 	// chunk with empty choices).

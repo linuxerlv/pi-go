@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -40,7 +39,6 @@ var readSchema = map[string]any{
 // (with optional line range and a truncation note for large files).
 type ReadTool struct {
 	BaseTool
-	Cwd string
 }
 
 // NewReadTool constructs a ReadTool anchored at cwd (for resolving relative
@@ -54,22 +52,18 @@ func NewReadTool(cwd string) *ReadTool {
 				Parameters:  readSchema,
 			},
 			ToolLabel: "Read",
+			Cwd:       cwd,
 		},
-		Cwd: cwd,
 	}
 }
 
 // Execute runs the read tool.
 func (t *ReadTool) Execute(ctx context.Context, toolCallID string, params map[string]any, onUpdate agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return agent.AgentToolResult{}, fmt.Errorf("path is required")
+	path, err := pathParam(params)
+	if err != nil {
+		return agent.AgentToolResult{}, err
 	}
-
-	abs := path
-	if !filepath.IsAbs(path) {
-		abs = filepath.Join(t.Cwd, path)
-	}
+	abs := t.resolvePath(path)
 
 	info, err := os.Stat(abs)
 	if err != nil {
