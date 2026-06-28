@@ -92,6 +92,12 @@ func (s *JsonlStorage) load() error {
 			s.counter = n
 		}
 	}
+	// If no leaf was recorded (e.g. an imported jsonl without a meta sidecar),
+	// default the leaf to the last appended entry so the branch is visible.
+	if s.leafID == nil && len(s.order) > 0 {
+		last := s.order[len(s.order)-1]
+		s.leafID = &last
+	}
 	return scanner.Err()
 }
 

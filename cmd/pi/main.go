@@ -16,6 +16,7 @@ import (
 	"github.com/linuxerlv/pi-go/internal/harness"
 	"github.com/linuxerlv/pi-go/internal/mcp"
 	"github.com/linuxerlv/pi-go/internal/orchestrator"
+	"github.com/linuxerlv/pi-go/internal/permission"
 	"github.com/linuxerlv/pi-go/internal/tools"
 	"github.com/linuxerlv/pi-go/internal/tui"
 )
@@ -42,6 +43,7 @@ func main() {
 	orchestrate := flag.Bool("orchestrate", false, "Use multi-agent orchestrator (decomposes the prompt into subtasks)")
 	strategy := flag.String("strategy", "sequential", "Orchestrator strategy: sequential | parallel")
 	maxAgents := flag.Int("max-agents", 4, "Maximum concurrent subtask agents (parallel strategy)")
+	permMode := flag.String("permission", "", "Permission mode: default | acceptEdits | bypass | plan (empty = permission disabled)")
 	flag.Parse()
 
 	if *prompt == "" && flag.NArg() > 0 {
@@ -95,14 +97,57 @@ func main() {
 		agentTools = append(agentTools, mcpTools...)
 	}
 
+	// Build the permission checker when --permission is set.
+	var perm *permission.Checker
+	if *permMode != "" {
+		perm = permission.New(permission.Options{
+			Mode:    permission.Mode(*permMode),
+			Enabled: true,
+			Store:   permission.NewStore(),
+			Asker:   makeStdinAsker(),
+		})
+	}
+
+	// --tui: interactive bubbletea interface (harness-backed, multi-turn).
+	if *useTUI {
+		sid := *sessionID
+		if sid == "" {
+			sid = "default"
+		}
+		h := newHarness(sessessionsDir(), sid, *system, model, prov, agentTools, skills, templates, nil)
+		runner := harnessRunnerAdapter{h: h}
+		// Wire the TUI's permission asker into the checker (if --permission set).
+		if perm != nil {
+			prog := tui.NewProgram(runner, model.ID)
+			perm = permission.New(permission.Options{
+				Mode:    permission.Mode(*permMode),
+				Enabled: true,
+				Store:   permission.NewStore(),
+				Asker:   prog.Asker(),
+			})
+			h.SetPermission(perm)
+			if err := prog.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "[tui error: %v]\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+		if err := tui.Run(runner, model.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "[tui error: %v]\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// No prompt: interactive REPL (always harness-backed for multi-turn memory).
 	if *prompt == "" {
 		sid := *sessionID
 		if sid == "" {
 			sid = "default"
 		}
-		h := newHarness(sessessionsDir(), sid, *system, model, prov, agentTools, skills, templates)
-		runREPL(ctx, h, *verbose)
+		h := newHarness(sessessionsDir(), sid, *system, model, prov, agentTools, skills, templates, perm)
+		mgr := harness.NewSessionManager(sessessionsDir())
+		runREPL(ctx, h, *verbose, sid, mgr, perm, model)
 		return
 	}
 
@@ -113,32 +158,15 @@ func main() {
 		return
 	}
 
-	// Set up the event emitter. --tui uses a differential-rendered view; the
-	// default streams events to stdout/stderr.
-	var view *tui.AgentView
-	if *useTUI {
-		term := tui.NewTerminal(os.Stdout)
-		view = tui.NewAgentView(term, "pi-go")
-		view.Start()
-	}
+	// Set up the event emitter for non-TUI modes (streaming print to stdout/stderr).
 	emit := func(ev agent.AgentEvent) error {
-		if view != nil {
-			view.HandleEvent(ev)
-		} else {
-			printEvent(ev, *verbose)
-		}
+		printEvent(ev, *verbose)
 		return nil
-	}
-	if *useTUI {
-		defer func() {
-			view.Stop()
-			fmt.Fprintln(os.Stderr)
-		}()
 	}
 
 	if *sessionID != "" {
 		// Harness mode: stateful, jsonl-persisted session.
-		runHarness(ctx, *sessionID, *prompt, *system, model, prov, agentTools, skills, templates, emit)
+		runHarness(ctx, *sessionID, *prompt, *system, model, prov, agentTools, skills, templates, perm, emit)
 		return
 	}
 
@@ -166,7 +194,7 @@ func main() {
 func sessessionsDir() string { return ".pi-go/sessions" }
 
 // newHarness builds an AgentHarness backed by a jsonl session.
-func newHarness(sessionsDir, sessionID, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, skills []harness.Skill, templates []harness.PromptTemplate) *harness.AgentHarness {
+func newHarness(sessionsDir, sessionID, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, skills []harness.Skill, templates []harness.PromptTemplate, perm *permission.Checker) *harness.AgentHarness {
 	storage, err := harness.NewJsonlStorage(sessionsDir, sessionID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[session error: %v]\n", err)
@@ -181,13 +209,14 @@ func newHarness(sessionsDir, sessionID, system string, model ai.Model, prov ai.P
 		Session:         sess,
 		Skills:          skills,
 		PromptTemplates: templates,
+		Permission:      perm,
 	})
 }
 
 // runHarness runs the prompt through an AgentHarness with a jsonl-persisted
 // session, so the conversation can be resumed later with the same --session id.
-func runHarness(ctx context.Context, sessionID, prompt, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, skills []harness.Skill, templates []harness.PromptTemplate, emit func(agent.AgentEvent) error) {
-	h := newHarness(sessessionsDir(), sessionID, system, model, prov, agentTools, skills, templates)
+func runHarness(ctx context.Context, sessionID, prompt, system string, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, skills []harness.Skill, templates []harness.PromptTemplate, perm *permission.Checker, emit func(agent.AgentEvent) error) {
+	h := newHarness(sessessionsDir(), sessionID, system, model, prov, agentTools, skills, templates, perm)
 	h.Subscribe(func(e harness.HarnessEvent) error {
 		if e.Agent != nil {
 			emit(e.Agent)

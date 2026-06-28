@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -102,6 +103,59 @@ func (s *Session) AppendMessage(msg agent.AgentMessage) (MessageEntry, error) {
 	leaf := e.ID
 	_ = s.storage.SetLeafID(&leaf)
 	return e, nil
+}
+
+// Fork creates a new branch starting at the given entry id. The leaf is moved
+// to fromEntryID; subsequent AppendMessage calls extend the new branch. If
+// fromEntryID is empty, the current leaf is used. Returns the new leaf id.
+func (s *Session) Fork(fromEntryID string) (string, error) {
+	target := fromEntryID
+	if target == "" {
+		target = derefOrEmpty(s.storage.GetLeafID())
+	}
+	if target == "" {
+		return "", fmt.Errorf("cannot fork: no leaf entry")
+	}
+	if _, ok := s.storage.GetEntry(target); !ok {
+		return "", fmt.Errorf("fork point %q not found", target)
+	}
+	leaf := target
+	if err := s.storage.SetLeafID(&leaf); err != nil {
+		return "", err
+	}
+	return leaf, nil
+}
+
+// SetLabel attaches a human-readable label to the current leaf entry.
+func (s *Session) SetLabel(label string) error {
+	leaf := derefOrEmpty(s.storage.GetLeafID())
+	if leaf == "" {
+		return fmt.Errorf("no leaf to label")
+	}
+	var labelPtr *string
+	if label != "" {
+		v := label
+		labelPtr = &v
+	}
+	e := LabelEntry{
+		EntryBase: EntryBase{
+			Type:      EntryLabel,
+			ID:        s.storage.CreateEntryID(),
+			ParentID:  s.storage.GetLeafID(),
+			Timestamp: nowISO(),
+		},
+		TargetID: leaf,
+		Label:    labelPtr,
+	}
+	return s.storage.AppendEntry(e)
+}
+
+// derefOrEmpty returns *p, or "" if p is nil.
+func derefOrEmpty(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // buildSessionContext reconstructs messages and runtime state from a branch's

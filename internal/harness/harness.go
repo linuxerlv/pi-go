@@ -8,6 +8,7 @@ import (
 
 	"github.com/linuxerlv/pi-go/internal/agent"
 	"github.com/linuxerlv/pi-go/internal/ai"
+	"github.com/linuxerlv/pi-go/internal/permission"
 )
 
 // Phase is the harness run state.
@@ -47,6 +48,9 @@ type Options struct {
 	// Compaction configures automatic context-window compaction. Nil disables
 	// automatic compaction (the default).
 	Compaction *CompactionConfig
+	// Permission, if set, is consulted before each tool call via the agent
+	// loop's BeforeToolCall hook. Nil disables permission checks.
+	Permission *permission.Checker
 }
 
 // AgentHarness is a stateful wrapper around the agent loop with session
@@ -64,6 +68,7 @@ type AgentHarness struct {
 	skills        []Skill
 	templates     []PromptTemplate
 	compaction    *CompactionConfig
+	permission    *permission.Checker
 
 	phase   Phase
 	runCtx  context.Context
@@ -90,6 +95,7 @@ func New(opts Options) *AgentHarness {
 		skills:        opts.Skills,
 		templates:     opts.PromptTemplates,
 		compaction:    opts.Compaction,
+		permission:    opts.Permission,
 		phase:         PhaseIdle,
 	}
 }
@@ -128,6 +134,21 @@ func (h *AgentHarness) SetThinkingLevel(level ai.ThinkingLevel) error {
 		EntryBase:      EntryBase{Type: EntryThinkingLevelChange, ID: h.session.Storage().CreateEntryID(), ParentID: h.session.GetLeafID(), Timestamp: nowISO()},
 		ThinkingLevel:  string(level),
 	})
+}
+
+// SetPermission replaces the permission checker at runtime (e.g. to wire a TUI
+// asker after the harness is constructed). Safe to call before the first turn.
+func (h *AgentHarness) SetPermission(c *permission.Checker) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.permission = c
+}
+
+// Permission returns the active checker (may be nil).
+func (h *AgentHarness) Permission() *permission.Checker {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.permission
 }
 
 // Subscribe registers an event handler. Returns an unsubscribe function.
@@ -220,6 +241,21 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string) ([]agent.AgentMe
 		ConvertToLlm:   agent.DefaultConvertToLlm,
 		GetSteeringMessages: h.drainSteer,
 		GetFollowUpMessages: h.drainFollowUp,
+	}
+	if h.permission != nil {
+		perm := h.permission
+		config.BeforeToolCall = func(ctx context.Context, c agent.BeforeToolCallContext) (*agent.BeforeToolCallResult, error) {
+			args := permission.CheckArgs{
+				ToolName: c.ToolCall.Name,
+				Path:     pathArg(c.Args),
+				Command:  commandArg(c.Args),
+			}
+			decision, reason := perm.Check(ctx, args)
+			if decision == permission.DecisionDeny {
+				return &agent.BeforeToolCallResult{Block: true, Reason: reason}, nil
+			}
+			return nil, nil
+		}
 	}
 
 	emit := func(ev agent.AgentEvent) error {
@@ -413,6 +449,31 @@ func (h *AgentHarness) Session() *Session { return h.session }
 
 func toAgentMessages(msgs []agent.AgentMessage) []agent.AgentMessage {
 	return msgs
+}
+
+// pathArg extracts a file path from validated tool args (read/write/edit/grep/
+// glob all use a "path" field). Returns "" for tools without a path.
+func pathArg(args any) string {
+	m, ok := args.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if s, ok := m["path"].(string); ok {
+		return s
+	}
+	return ""
+}
+
+// commandArg extracts the bash command string from validated tool args.
+func commandArg(args any) string {
+	m, ok := args.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if s, ok := m["command"].(string); ok {
+		return s
+	}
+	return ""
 }
 
 // compactIfNeeded runs automatic compaction when the session context exceeds
