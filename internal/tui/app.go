@@ -61,6 +61,7 @@ type Model struct {
 
 	history_input []string // user input history
 	histIdx       int
+	slashHandler  func(line string) (handled bool, output string)
 }
 
 // historyLine is one rendered line of the conversation.
@@ -170,10 +171,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.histIdx = len(m.history_input)
 		m.appendLine(userStyle.Render("you: ") + text)
 		if strings.HasPrefix(text, "/") {
-			// Slash commands are handled by the CLI's command registry via the
-			// harness; here we just send them as prompts. The CLI wires real
-			// slash handling around the TUI.
-			m.appendLine(dimStyle.Render("(use the line-mode REPL for slash commands)"))
+			if m.slashHandler != nil {
+				handled, output := m.slashHandler(text)
+				if output != "" {
+					m.appendLine(dimStyle.Render(output))
+				}
+				if handled {
+					return m, nil
+				}
+			} else {
+				m.appendLine(dimStyle.Render("(no slash handler wired)"))
+			}
 			return m, nil
 		}
 		m.running = true

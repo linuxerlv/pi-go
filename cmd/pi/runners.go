@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/linuxerlv/pi-go/internal/agent"
 	"github.com/linuxerlv/pi-go/internal/ai"
@@ -74,9 +75,11 @@ func (tuiRunner) Run(d deps) error {
 	sid := resolveSessionID(d)
 	h := newHarness(sessessionsDir(), sid, d.system, d.model, d.prov, d.tools, d.skills, d.templates, nil)
 	runner := harnessRunnerAdapter{h: h}
+	mgr := harness.NewSessionManager(sessessionsDir())
+	slash := makeTUISlashHandler(h, mgr, sid, d.perm, d.model)
 	// Wire the TUI's permission asker into the checker (if --permission set).
 	if d.perm != nil {
-		prog := tui.NewProgram(runner, d.model.ID)
+		prog := tui.NewProgram(runner, d.model.ID, slash)
 		perm := permission.New(permission.Options{
 			Mode:    permission.Mode(d.permMode),
 			Enabled: true,
@@ -87,6 +90,27 @@ func (tuiRunner) Run(d deps) error {
 		return prog.Run()
 	}
 	return tui.Run(runner, d.model.ID)
+}
+
+// makeTUISlashHandler builds the slash handler the TUI uses for '/'-prefixed
+// input. It routes to the shared command registry and returns any output text
+// for the TUI to render (it does not itself print; the TUI appends it).
+func makeTUISlashHandler(h *harness.AgentHarness, mgr *harness.SessionManager, sid string, perm *permission.Checker, model ai.Model) func(line string) (bool, string) {
+	quit := false
+	return func(line string) (bool, string) {
+		var sb strings.Builder
+		sc := SlashContext{
+			Harness:    h,
+			SessionMgr: mgr,
+			SessionID:  sid,
+			Permission:  perm,
+			Model:       model,
+			Out:         &sb,
+			Quit:        &quit,
+		}
+		handled, _ := dispatchSlash(line, sc)
+		return handled, strings.TrimRight(sb.String(), "\n")
+	}
 }
 
 type replRunner struct{}

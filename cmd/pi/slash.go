@@ -26,6 +26,7 @@ type SlashContext struct {
 type Command struct {
 	Name        string
 	Description string
+	Usage       string // args description, e.g. "<id>" or "<path.html|.jsonl>"; "" if no args
 	Run         func(args []string, sc SlashContext) error
 }
 
@@ -36,15 +37,15 @@ func commands() []Command {
 		{Name: "/quit", Description: "Exit pi-go", Run: cmdQuit},
 		{Name: "/exit", Description: "Exit pi-go", Run: cmdQuit},
 		{Name: "/sessions", Description: "List sessions", Run: cmdSessions},
-		{Name: "/resume", Description: "Switch to a session by id: /resume <id>", Run: cmdResume},
-		{Name: "/new", Description: "Start a new session: /new [id]", Run: cmdNew},
+		{Name: "/resume", Description: "Switch to a session", Usage: "<id>", Run: cmdResume},
+		{Name: "/new", Description: "Start a new session", Usage: "[id]", Run: cmdNew},
 		{Name: "/fork", Description: "Fork the session at the current point", Run: cmdFork},
-		{Name: "/name", Description: "Set a session label: /name <text>", Run: cmdName},
+		{Name: "/name", Description: "Set a session label", Usage: "<text>", Run: cmdName},
 		{Name: "/session", Description: "Show current session info", Run: cmdSession},
-		{Name: "/export", Description: "Export session: /export <path.html|.jsonl>", Run: cmdExport},
-		{Name: "/import", Description: "Import a jsonl session: /import <path> [id]", Run: cmdImport},
-		{Name: "/model", Description: "Switch model: /model <id>", Run: cmdModel},
-		{Name: "/permission", Description: "Set permission mode: /permission default|acceptEdits|bypass|plan", Run: cmdPermission},
+		{Name: "/export", Description: "Export session", Usage: "<path.html|.jsonl>", Run: cmdExport},
+		{Name: "/import", Description: "Import a jsonl session", Usage: "<path> [id]", Run: cmdImport},
+		{Name: "/model", Description: "Switch model", Usage: "<id>", Run: cmdModel},
+		{Name: "/permission", Description: "Set permission mode", Usage: "default|acceptEdits|bypass|plan", Run: cmdPermission},
 		{Name: "/compact", Description: "Manually compact context (if configured)", Run: cmdCompact},
 		{Name: "/tools", Description: "List available tools", Run: cmdTools},
 	}
@@ -73,7 +74,11 @@ func dispatchSlash(line string, sc SlashContext) (bool, bool) {
 func cmdHelp(args []string, sc SlashContext) error {
 	fmt.Fprintln(sc.Out, "commands:")
 	for _, c := range commands() {
-		fmt.Fprintf(sc.Out, "  %-12s %s\n", c.Name, c.Description)
+		if c.Usage != "" {
+			fmt.Fprintf(sc.Out, "  %-12s %s  %s\n", c.Name, c.Usage, c.Description)
+		} else {
+			fmt.Fprintf(sc.Out, "  %-12s %s\n", c.Name, c.Description)
+		}
 	}
 	return nil
 }

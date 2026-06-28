@@ -19,8 +19,11 @@ type Program struct {
 
 // NewProgram constructs the TUI program (alt screen) without starting it, so
 // the caller can wire the permission asker into a harness before running.
-func NewProgram(h HarnessRunner, modelName string) *Program {
+// slashHandler, if non-nil, is called for lines beginning with '/'; it returns
+// whether it handled the command and any text to display.
+func NewProgram(h HarnessRunner, modelName string, slashHandler func(line string) (handled bool, output string)) *Program {
 	m := NewModel(h, modelName)
+	m.slashHandler = slashHandler
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	// Subscribe to agent events; forward each into the tea loop.
 	h.Subscribe(func(ev agent.AgentEvent) {
@@ -51,9 +54,9 @@ func (pr *Program) Run() error {
 }
 
 // Run is a convenience that builds and runs a program in one call (no permission
-// asker wiring). Used when permission is disabled.
+// asker or slash handler wiring). Used when permission is disabled.
 func Run(h HarnessRunner, modelName string) error {
-	pr := NewProgram(h, modelName)
+	pr := NewProgram(h, modelName, nil)
 	return pr.Run()
 }
 
