@@ -125,10 +125,9 @@ func (o *Orchestrator) RunSubtask(ctx context.Context, subtask SubTask) (string,
 	prompts := []agent.AgentMessage{
 		ai.UserMessage{Content: subtask.Description, Timestamp: ai.Now()},
 	}
-	config := agent.AgentLoopConfig{
-		Model:        o.model,
-		ConvertToLlm: agent.DefaultConvertToLlm,
-	}
+	config := agent.NewLoopConfig(o.model).
+		WithConvertToLlm(agent.DefaultConvertToLlm).
+		Build()
 
 	var parts []string
 	emit := func(ev agent.AgentEvent) error {

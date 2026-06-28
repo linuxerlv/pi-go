@@ -18,7 +18,6 @@ import (
 	"github.com/linuxerlv/pi-go/internal/orchestrator"
 	"github.com/linuxerlv/pi-go/internal/permission"
 	"github.com/linuxerlv/pi-go/internal/tools"
-	"github.com/linuxerlv/pi-go/internal/tui"
 )
 
 func main() {
@@ -108,85 +107,26 @@ func main() {
 		})
 	}
 
-	// --tui: interactive bubbletea interface (harness-backed, multi-turn).
-	if *useTUI {
-		sid := *sessionID
-		if sid == "" {
-			sid = "default"
-		}
-		h := newHarness(sessessionsDir(), sid, *system, model, prov, agentTools, skills, templates, nil)
-		runner := harnessRunnerAdapter{h: h}
-		// Wire the TUI's permission asker into the checker (if --permission set).
-		if perm != nil {
-			prog := tui.NewProgram(runner, model.ID)
-			perm = permission.New(permission.Options{
-				Mode:    permission.Mode(*permMode),
-				Enabled: true,
-				Store:   permission.NewStore(),
-				Asker:   prog.Asker(),
-			})
-			h.SetPermission(perm)
-			if err := prog.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "[tui error: %v]\n", err)
-				os.Exit(1)
-			}
-			return
-		}
-		if err := tui.Run(runner, model.ID); err != nil {
-			fmt.Fprintf(os.Stderr, "[tui error: %v]\n", err)
-			os.Exit(1)
-		}
-		return
+	// Assemble the shared deps and dispatch to the selected run mode.
+	d := deps{
+		ctx:         ctx,
+		model:       model,
+		prov:        prov,
+		tools:       agentTools,
+		skills:      skills,
+		templates:   templates,
+		perm:        perm,
+		permMode:    *permMode,
+		system:      *system,
+		sessionID:   *sessionID,
+		verbose:     *verbose,
+		prompt:      *prompt,
+		orchestrate: *orchestrate,
+		strategy:    *strategy,
+		maxAgents:   *maxAgents,
+		useTUI:      *useTUI,
 	}
-
-	// No prompt: interactive REPL (always harness-backed for multi-turn memory).
-	if *prompt == "" {
-		sid := *sessionID
-		if sid == "" {
-			sid = "default"
-		}
-		h := newHarness(sessessionsDir(), sid, *system, model, prov, agentTools, skills, templates, perm)
-		mgr := harness.NewSessionManager(sessessionsDir())
-		runREPL(ctx, h, *verbose, sid, mgr, perm, model)
-		return
-	}
-
-	// Orchestrator mode: break the prompt into subtasks and delegate to
-	// multiple agent runs with optional parallel execution.
-	if *orchestrate {
-		runOrchestrator(ctx, *prompt, *system, *strategy, *maxAgents, model, prov, agentTools, *verbose)
-		return
-	}
-
-	// Set up the event emitter for non-TUI modes (streaming print to stdout/stderr).
-	emit := func(ev agent.AgentEvent) error {
-		printEvent(ev, *verbose)
-		return nil
-	}
-
-	if *sessionID != "" {
-		// Harness mode: stateful, jsonl-persisted session.
-		runHarness(ctx, *sessionID, *prompt, *system, model, prov, agentTools, skills, templates, perm, emit)
-		return
-	}
-
-	// Bare loop mode (M2 behavior).
-	context_ := agent.AgentContext{
-		SystemPrompt: *system,
-		Tools:        agentTools,
-	}
-	prompts := []agent.AgentMessage{
-		ai.UserMessage{Content: *prompt, Timestamp: ai.Now()},
-	}
-	config := agent.AgentLoopConfig{
-		Model:        model,
-		ConvertToLlm: agent.DefaultConvertToLlm,
-	}
-
-	if _, err := agent.RunAgentLoop(ctx, prompts, context_, config, prov, emit); err != nil {
-		fmt.Fprintf(os.Stderr, "\n[loop error: %v]\n", err)
-		os.Exit(1)
-	}
+	runMode(d)
 	fmt.Fprintln(os.Stderr)
 }
 

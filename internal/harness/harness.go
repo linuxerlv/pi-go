@@ -235,16 +235,14 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string) ([]agent.AgentMe
 	}
 	prompts := []agent.AgentMessage{promptMsg}
 
-	config := agent.AgentLoopConfig{
-		Model:          h.model,
-		ThinkingLevel:  h.thinkingLevel,
-		ConvertToLlm:   agent.DefaultConvertToLlm,
-		GetSteeringMessages: h.drainSteer,
-		GetFollowUpMessages: h.drainFollowUp,
-	}
+	builder := agent.NewLoopConfig(h.model).
+		WithThinking(h.thinkingLevel).
+		WithConvertToLlm(agent.DefaultConvertToLlm).
+		WithSteering(h.drainSteer).
+		WithFollowUp(h.drainFollowUp)
 	if h.permission != nil {
 		perm := h.permission
-		config.BeforeToolCall = func(ctx context.Context, c agent.BeforeToolCallContext) (*agent.BeforeToolCallResult, error) {
+		beforeFn := func(ctx context.Context, c agent.BeforeToolCallContext) (*agent.BeforeToolCallResult, error) {
 			args := permission.CheckArgs{
 				ToolName: c.ToolCall.Name,
 				Path:     pathArg(c.Args),
@@ -256,7 +254,9 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string) ([]agent.AgentMe
 			}
 			return nil, nil
 		}
+		builder = builder.WithPermission(beforeFn, nil)
 	}
+	config := builder.Build()
 
 	emit := func(ev agent.AgentEvent) error {
 		h.emit(ev)
