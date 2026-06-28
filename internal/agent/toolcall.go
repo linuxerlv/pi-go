@@ -43,6 +43,39 @@ func executeToolCalls(
 	return executeToolCallsParallel(ctx, currentContext, assistantMessage, toolCalls, config, emit)
 }
 
+// prepareAndExecuteOne runs the prepare->execute->finalize pipeline for a single
+// tool call, returning the finalized outcome. It is the shared core of both the
+// sequential and parallel executors (which differ only in scheduling and emit
+// ordering). Emit of start/end events is the caller's responsibility, so each
+// executor controls its own ordering semantics. onUpdate is the emit sink for
+// tool_execution_update events produced during execution (parallel wraps it in
+// a mutex).
+func prepareAndExecuteOne(
+	ctx context.Context,
+	currentContext AgentContext,
+	assistantMessage ai.AssistantMessage,
+	tc ai.ToolCall,
+	config AgentLoopConfig,
+	onUpdate EventSink,
+) (finalizedToolCall, error) {
+	prep, err := prepareToolCall(ctx, currentContext, assistantMessage, tc, config)
+	if err != nil {
+		return finalizedToolCall{}, err
+	}
+	if prep.immediate {
+		return finalizedToolCall{toolCall: tc, result: prep.result, isError: prep.isError}, nil
+	}
+	executedResult, executedIsError, err := executePreparedToolCall(ctx, prep, onUpdate)
+	if err != nil {
+		return finalizedToolCall{}, err
+	}
+	f, err := finalizeExecutedToolCall(ctx, currentContext, assistantMessage, prep, executedResult, executedIsError, config)
+	if err != nil {
+		return finalizedToolCall{}, err
+	}
+	return f, nil
+}
+
 func executeToolCallsSequential(
 	ctx context.Context,
 	currentContext AgentContext,
@@ -57,22 +90,9 @@ func executeToolCallsSequential(
 	for _, tc := range toolCalls {
 		emit(ToolExecutionStartEvent{ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
 
-		prep, err := prepareToolCall(ctx, currentContext, assistantMessage, tc, config)
+		f, err := prepareAndExecuteOne(ctx, currentContext, assistantMessage, tc, config, emit)
 		if err != nil {
 			return executedToolCallBatch{}, err
-		}
-		var f finalizedToolCall
-		if prep.immediate {
-			f = finalizedToolCall{toolCall: tc, result: prep.result, isError: prep.isError}
-		} else {
-			executedResult, executedIsError, err := executePreparedToolCall(ctx, prep, emit)
-			if err != nil {
-				return executedToolCallBatch{}, err
-			}
-			f, err = finalizeExecutedToolCall(ctx, currentContext, assistantMessage, prep, executedResult, executedIsError, config)
-			if err != nil {
-				return executedToolCallBatch{}, err
-			}
 		}
 
 		emit(ToolExecutionEndEvent{ToolCallID: f.toolCall.ID, ToolName: f.toolCall.Name, Result: f.result, IsError: f.isError})
@@ -164,25 +184,21 @@ func executeToolCallsParallel(
 				defer mu.Unlock()
 				return emit(e)
 			})
+			mu.Lock()
+			defer mu.Unlock()
 			if err != nil {
-				// Encode as an error result; execution errors are non-fatal to
-				// the loop. We can't return from the goroutine cleanly, so
-				// stash the error result.
-				mu.Lock()
+				// Execution errors are non-fatal to the loop; encode as error result.
 				finalized[i] = finalizedToolCall{
 					toolCall: entry.toolCall,
 					result:   errorToolResult(err.Error()),
 					isError:  true,
 				}
 				emit(ToolExecutionEndEvent{ToolCallID: entry.toolCall.ID, ToolName: entry.toolCall.Name, Result: finalized[i].result, IsError: true})
-				mu.Unlock()
 				return
 			}
 			f, _ := finalizeExecutedToolCall(ctx, currentContext, assistantMessage, entry.prepared, executedResult, executedIsError, config)
-			mu.Lock()
 			finalized[i] = f
 			emit(ToolExecutionEndEvent{ToolCallID: f.toolCall.ID, ToolName: f.toolCall.Name, Result: f.result, IsError: f.isError})
-			mu.Unlock()
 		}(i, entry)
 	}
 	wg.Wait()
