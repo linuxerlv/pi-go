@@ -199,7 +199,10 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string) ([]agent.AgentMe
 	sessCtx = h.session.BuildContext()
 
 	promptMsg := ai.UserMessage{Content: text, Timestamp: ai.Now()}
-	if err := h.appendMessageLocked(promptMsg); err != nil {
+	// appendMessage acquires h.mu internally; Prompt released the lock at the
+	// top of this function, so we must NOT use appendMessageLocked here (which
+	// assumes the caller already holds the lock).
+	if err := h.appendMessage(promptMsg); err != nil {
 		return nil, err
 	}
 
@@ -266,7 +269,6 @@ func (h *AgentHarness) PromptFromTemplate(ctx context.Context, name string, args
 	return h.Prompt(ctx, FormatPromptTemplateInvocation(t, args))
 }
 
-// effectiveSystemPrompt returns the configured system prompt with a list of
 // effectiveSystemPrompt returns the configured system prompt with a list of
 // available skills appended, delegated to the resources component.
 func (h *AgentHarness) effectiveSystemPrompt() string {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/linuxerlv/pi-go/internal/agent"
@@ -284,3 +285,52 @@ func TestCompactionDisabledDoesNotCompact(t *testing.T) {
 }
 
 var _ = fmt.Sprintf
+
+// TestPromptConcurrentWithPhaseSteer runs a Prompt while other goroutines poke
+// Phase/Steer. It guards against deadlocks and (under -race) the unlocked
+// session write that Prompt used to perform via appendMessageLocked.
+func TestPromptConcurrentWithPhaseSteer(t *testing.T) {
+	// Two scripted turns: the first turn leaves the agent ready for a steering
+	// message to be injected between turns.
+	prov := newMockProvider(scriptTextTurn("turn-1"), scriptTextTurn("turn-2"))
+	sess := NewSession(NewMemoryStorage(SessionMetadata{ID: "s1", CreatedAt: nowISO()}))
+	h := New(Options{
+		Provider:     prov,
+		Model:        ai.Model{ID: "mock-model", API: ai.APIAnthropicMessages, Provider: "mock"},
+		SystemPrompt: "you are a test bot",
+		Session:      sess,
+	})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Poking goroutine: hammer Phase and attempt Steer throughout the run.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = h.Phase()
+				_ = h.Steer("mid-run steering") // returns error while idle; ok
+			}
+		}
+	}()
+
+	if _, err := h.Prompt(context.Background(), "hi"); err != nil {
+		t.Fatalf("Prompt failed: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+
+	// The prompt message must have been persisted through the locking path.
+	ctx := sess.BuildContext()
+	if len(ctx.Messages) == 0 {
+		t.Fatal("expected persisted messages after concurrent Prompt")
+	}
+	if _, ok := ctx.Messages[0].(ai.UserMessage); !ok {
+		t.Fatalf("expected first persisted message to be the user prompt, got %T", ctx.Messages[0])
+	}
+}
