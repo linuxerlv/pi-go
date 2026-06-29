@@ -22,7 +22,7 @@ import (
 
 func main() {
 	loadDotEnv(".env")
-	cfg := loadConfig(defaultConfigPath())
+	cfg := loadMergedConfig()
 
 	prompt := flag.String("prompt", "", "Prompt to send to the model")
 	modelID := flag.String("model", cfg.Model, "Model id (default depends on provider or config)")
