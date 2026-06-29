@@ -88,13 +88,24 @@ func main() {
 	defer cancel()
 
 	// Launch optional MCP server(s) and register their tools.
+	var mcpClients []*mcp.Client
 	if *mcpServers != "" {
-		mcpTools, err := loadMCPTools(ctx, *mcpServers)
+		mcpTools, client, err := loadMCPTools(ctx, *mcpServers)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[mcp warning: %v]\n", err)
 		}
 		agentTools = append(agentTools, mcpTools...)
+		if client != nil {
+			mcpClients = append(mcpClients, client)
+		}
 	}
+	// Ensure MCP child processes are killed on exit; ctx cancellation alone does
+	// not terminate them (the MCP client kills the server in Close).
+	defer func() {
+		for _, c := range mcpClients {
+			c.Close()
+		}
+	}()
 
 	// Build the permission checker when --permission is set.
 	var perm *permission.Checker
@@ -210,29 +221,30 @@ func runOrchestrator(ctx context.Context, prompt, system, strategyName string, m
 	fmt.Fprintf(os.Stderr, "\nFinal Answer:\n%s\n", result.FinalAnswer)
 }
 
-// loadMCPTools launches an MCP server (quoted string) and returns its tools.
-func loadMCPTools(ctx context.Context, command string) ([]agent.AgentTool, error) {
+// loadMCPTools launches an MCP server (quoted string) and returns its tools
+// plus the client (caller must Close it to reap the child process).
+func loadMCPTools(ctx context.Context, command string) ([]agent.AgentTool, *mcp.Client, error) {
 	parts, err := splitShellArgs(command)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(parts) == 0 {
-		return nil, fmt.Errorf("empty mcp command")
+		return nil, nil, fmt.Errorf("empty mcp command")
 	}
 	client, err := mcp.Start(ctx, parts[0], parts[1:], nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defs, err := client.ListTools(ctx)
 	if err != nil {
 		client.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	var out []agent.AgentTool
 	for _, d := range defs {
 		out = append(out, mcp.NewMCPTool(client, d))
 	}
-	return out, nil
+	return out, client, nil
 }
 
 // splitShellArgs splits a command string on whitespace, honoring double quotes.
