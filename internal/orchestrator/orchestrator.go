@@ -242,6 +242,9 @@ func (s *ParallelStrategy) Execute(ctx context.Context, subtasks []SubTask, o *O
 			output, err := o.RunSubtask(ctx, sub)
 			if err != nil {
 				errOnce.Do(func() { execErr = fmt.Errorf("subtask %s failed: %w", sub.ID, err) })
+				// Record a placeholder so the synthesis phase sees the failure
+				// rather than an empty zero-value result.
+				results[idx] = SubTaskResult{SubTask: sub, Output: fmt.Sprintf("[subtask %s failed: %v]", sub.ID, err)}
 				return
 			}
 			results[idx] = SubTaskResult{SubTask: sub, Output: output}

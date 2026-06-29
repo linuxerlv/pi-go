@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/linuxerlv/pi-go/internal/ai"
@@ -114,5 +115,42 @@ func TestOrchestratorParallel(t *testing.T) {
 	}
 	if result.FinalAnswer == "" {
 		t.Fatal("expected non-empty final answer")
+	}
+}
+
+// TestParallelStrategyFailureRecordsPlaceholder verifies that when a subtask
+// fails, its result slot is filled with a failure placeholder instead of being
+// left as a zero-value empty SubTaskResult that synthesis would silently drop.
+func TestParallelStrategyFailureRecordsPlaceholder(t *testing.T) {
+	prov := &mockStreamProvider{}
+	orch := New(Options{
+		Provider: prov,
+		Model:    ai.Model{ID: "mock-model", API: ai.APIAnthropicMessages, Provider: "mock-orch"},
+		Strategy: &ParallelStrategy{MaxConcurrency: 2},
+	})
+	subtasks := []SubTask{
+		{ID: "1", Description: "a"},
+		{ID: "2", Description: "b"},
+	}
+	// Pre-cancel so RunSubtask fails fast (runLoop returns ctx.Err() at the top).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	strat := &ParallelStrategy{MaxConcurrency: 2}
+	results, err := strat.Execute(ctx, subtasks, orch)
+	// Execute returns the first failure as err but still populates results.
+	if err == nil {
+		t.Fatal("expected Execute to return an error when subtasks fail")
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 result slots, got %d", len(results))
+	}
+	for i, r := range results {
+		if r.SubTask.ID != subtasks[i].ID {
+			t.Errorf("result[%d] subtask id = %q, want %q", i, r.SubTask.ID, subtasks[i].ID)
+		}
+		if !strings.Contains(r.Output, "failed") {
+			t.Errorf("result[%d] output %q should contain a failure placeholder", i, r.Output)
+		}
 	}
 }
