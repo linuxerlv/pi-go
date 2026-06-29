@@ -15,11 +15,10 @@ import (
 type Phase string
 
 const (
-	PhaseIdle           Phase = "idle"
-	PhaseTurn           Phase = "turn"
-	PhaseCompaction     Phase = "compaction"
-	PhaseBranchSummary  Phase = "branch_summary"
-	PhaseRetry          Phase = "retry"
+	PhaseIdle          Phase = "idle"
+	PhaseTurn          Phase = "turn"
+	PhaseCompaction    Phase = "compaction"
+	PhaseBranchSummary Phase = "branch_summary"
 )
 
 // HarnessEvent is emitted by the harness to subscribers. It wraps an agent
@@ -199,12 +198,12 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string) ([]agent.AgentMe
 	sessCtx = h.session.BuildContext()
 
 	promptMsg := ai.UserMessage{Content: text, Timestamp: ai.Now()}
-	// appendMessage acquires h.mu internally; Prompt released the lock at the
-	// top of this function, so we must NOT use appendMessageLocked here (which
-	// assumes the caller already holds the lock).
-	if err := h.appendMessage(promptMsg); err != nil {
-		return nil, err
-	}
+	// The prompt is persisted via the emit path: RunAgentLoop emits a
+	// MessageEndEvent for each prompt (agent-loop.go), and persistFromEvent
+	// appends user messages to the session. Persisting through one
+	// authoritative path (rather than a separate explicit append here) keeps
+	// the message ordering consistent: prompt becomes the leaf before any
+	// assistant/tool-result message is appended.
 
 	agentCtx := agent.AgentContext{
 		SystemPrompt: h.effectiveSystemPrompt(),
@@ -344,7 +343,7 @@ func (h *AgentHarness) persistFromEvent(ev agent.AgentEvent) {
 	case agent.MessageEndEvent:
 		if m, ok := e.Message.(ai.Message); ok {
 			switch msg := m.(type) {
-			case ai.AssistantMessage, ai.ToolResultMessage:
+			case ai.AssistantMessage, ai.ToolResultMessage, ai.UserMessage:
 				_ = h.appendMessage(msg)
 			}
 		}

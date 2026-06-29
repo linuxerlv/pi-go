@@ -81,15 +81,24 @@ func TestOrchestratorSequential(t *testing.T) {
 
 func TestParseSubTasks(t *testing.T) {
 	tests := []struct {
-		input string
-		n     int
+		input   string
+		n       int
+		wantErr bool
 	}{
-		{`[{"id":"1","description":"task one"}]`, 1},
-		{`[{"id":"a","description":"x"},{"id":"b","description":"y"}]`, 2},
-		{`plain text fallback`, 1},
+		{`[{"id":"1","description":"task one"}]`, 1, false},
+		{`[{"id":"a","description":"x"},{"id":"b","description":"y"}]`, 2, false},
+		// A non-JSON response is a malformed plan and must surface an error
+		// rather than silently degrading into a single subtask (defect 3).
+		{`plain text fallback`, 0, true},
 	}
 	for _, tc := range tests {
 		tasks, err := parseSubTasks(tc.input)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("input %q: expected error, got nil (tasks=%v)", tc.input, tasks)
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

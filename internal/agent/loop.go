@@ -242,12 +242,17 @@ func streamAssistantResponse(
 	var partial *ai.AssistantMessage
 	addedPartial := false
 
+	// NOTE: this function does not mutate context_.Messages. AgentContext is
+	// passed by value, so writes here would be invisible to the caller (dead
+	// code) and — when the caller's slice has spare capacity — could alias
+	// shared backing storage. The loop owns the single authoritative append of
+	// the finalized message (see runLoop). We only consume context_ for its
+	// SystemPrompt/Tools and TransformContext input.
 	for ev := range stream.Range {
 		switch e := ev.(type) {
 		case ai.StartEvent:
 			m := e.Partial
 			partial = &m
-			context_.Messages = append(context_.Messages, m)
 			addedPartial = true
 			emit(MessageStartEvent{Message: m})
 
@@ -257,20 +262,12 @@ func streamAssistantResponse(
 			if partial != nil {
 				m := partialFromEvent(e, *partial)
 				partial = &m
-				// Replace the last message (the in-flight partial).
-				idx := len(context_.Messages) - 1
-				if idx >= 0 {
-					context_.Messages[idx] = m
-				}
 				emit(MessageUpdateEvent{Message: m, AssistantMessageEvent: e})
 			}
 
 		case ai.DoneEvent, ai.ErrorEvent:
 			final, _ := ai.TerminalMessage(e)
-			if addedPartial {
-				context_.Messages[len(context_.Messages)-1] = final
-			} else {
-				context_.Messages = append(context_.Messages, final)
+			if !addedPartial {
 				emit(MessageStartEvent{Message: final})
 			}
 			emit(MessageEndEvent{Message: final})

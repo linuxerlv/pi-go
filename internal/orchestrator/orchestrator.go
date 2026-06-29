@@ -14,6 +14,7 @@ import (
 
 	"github.com/linuxerlv/pi-go/internal/agent"
 	"github.com/linuxerlv/pi-go/internal/ai"
+	"github.com/linuxerlv/pi-go/internal/permission"
 )
 
 // Strategy controls how a task is planned, executed, and synthesized.
@@ -54,6 +55,16 @@ type Options struct {
 	Tools        []agent.AgentTool
 	Strategy     Strategy
 	MaxTokens    int
+	// Permission, if set, is consulted before each subagent tool call (mirrors
+	// the harness's BeforeToolCall wiring). Without it, --orchestrate runs
+	// subagents that bypass the permission model entirely.
+	Permission *permission.Checker
+	// ToolFactory returns a fresh set of tools per subagent. When non-nil, each
+	// subtask agent gets its own tool instances, isolating stateful tools under
+	// parallel execution. When nil, the shared Tools slice is used (built-in
+	// tools are stateless and safe to share, but a factory future-proofs
+	// stateful tools and per-subagent working directories).
+	ToolFactory func() []agent.AgentTool
 }
 
 // Orchestrator coordinates multiple agent runs to solve a single high-level task.
@@ -62,8 +73,10 @@ type Orchestrator struct {
 	model        ai.Model
 	systemPrompt string
 	tools        []agent.AgentTool
+	toolFactory  func() []agent.AgentTool
 	strategy     Strategy
 	maxTokens    int
+	permission   *permission.Checker
 }
 
 // New creates an Orchestrator. If opts.Strategy is nil, a sequential strategy is
@@ -82,9 +95,21 @@ func New(opts Options) *Orchestrator {
 		model:        opts.Model,
 		systemPrompt: opts.SystemPrompt,
 		tools:        opts.Tools,
+		toolFactory:  opts.ToolFactory,
 		strategy:     strategy,
 		maxTokens:    maxTokens,
+		permission:   opts.Permission,
 	}
+}
+
+// toolsForSubtask returns the tool set for a subagent: the factory's output if
+// configured, otherwise the shared slice. Each subtask calls this so a
+// configured factory yields isolated instances per subagent.
+func (o *Orchestrator) toolsForSubtask() []agent.AgentTool {
+	if o.toolFactory != nil {
+		return o.toolFactory()
+	}
+	return o.tools
 }
 
 // Run executes the task by planning, executing, and synthesizing.
@@ -120,14 +145,33 @@ func (o *Orchestrator) Run(ctx context.Context, task string) (*Result, error) {
 func (o *Orchestrator) RunSubtask(ctx context.Context, subtask SubTask) (string, error) {
 	ctx_ := agent.AgentContext{
 		SystemPrompt: o.systemPrompt,
-		Tools:        o.tools,
+		Tools:        o.toolsForSubtask(),
 	}
 	prompts := []agent.AgentMessage{
 		ai.UserMessage{Content: subtask.Description, Timestamp: ai.Now()},
 	}
-	config := agent.NewLoopConfig(o.model).
-		WithConvertToLlm(agent.DefaultConvertToLlm).
-		Build()
+	builder := agent.NewLoopConfig(o.model).
+		WithConvertToLlm(agent.DefaultConvertToLlm)
+	if o.permission != nil {
+		// Mirror the harness's BeforeToolCall wiring so orchestrated
+		// subagents are subject to the same permission model as interactive
+		// runs. TODO: pathArg/commandArg hardcode tool arg shapes here and in
+		// harness; the proper fix is for AgentTool to self-describe its
+		// permission signature (defect 13, out of scope here).
+		perm := o.permission
+		builder = builder.WithPermission(func(ctx context.Context, c agent.BeforeToolCallContext) (*agent.BeforeToolCallResult, error) {
+			decision, reason := perm.Check(ctx, permission.CheckArgs{
+				ToolName: c.ToolCall.Name,
+				Path:     pathArg(c.Args),
+				Command:  commandArg(c.Args),
+			})
+			if decision == permission.DecisionDeny {
+				return &agent.BeforeToolCallResult{Block: true, Reason: reason}, nil
+			}
+			return nil, nil
+		}, nil)
+	}
+	config := builder.Build()
 
 	var parts []string
 	emit := func(ev agent.AgentEvent) error {
@@ -142,7 +186,14 @@ func (o *Orchestrator) RunSubtask(ctx context.Context, subtask SubTask) (string,
 	if _, err := agent.RunAgentLoop(ctx, prompts, ctx_, config, o.provider, emit); err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(strings.Join(parts, "")), nil
+	output := strings.TrimSpace(strings.Join(parts, ""))
+	if output == "" {
+		// The subtask produced no text (e.g. the final assistant message
+		// contained only tool_use blocks). Surface this rather than feeding an
+		// empty string into synthesis.
+		return "", fmt.Errorf("subtask %s produced no output", subtask.ID)
+	}
+	return output, nil
 }
 
 // streamText sends a single-turn prompt to the LLM and returns the text response.
@@ -272,8 +323,10 @@ func parseSubTasks(text string) ([]SubTask, error) {
 	}
 	var tasks []SubTask
 	if err := json.Unmarshal([]byte(text), &tasks); err != nil {
-		// Fallback: treat the whole response as a single subtask.
-		return []SubTask{{ID: "1", Description: text}}, nil
+		// Do not silently fall back to a single subtask: a malformed plan is a
+		// real failure that should surface rather than degrade the run into one
+		// subtask that may not match the user's intent.
+		return nil, fmt.Errorf("parse subtasks: %w", err)
 	}
 	// Normalize ids.
 	for i := range tasks {
@@ -295,4 +348,31 @@ func assistantText(am ai.AssistantMessage) string {
 		}
 	}
 	return strings.Join(parts, "")
+}
+
+// pathArg extracts a file path from validated tool args (read/write/edit/grep/
+// glob use a "path" field). Returns "" for tools without a path. Duplicated
+// from harness.pathArg; see the TODO in RunSubtask.
+func pathArg(args any) string {
+	m, ok := args.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if s, ok := m["path"].(string); ok {
+		return s
+	}
+	return ""
+}
+
+// commandArg extracts the bash command string from validated tool args.
+// Duplicated from harness.commandArg; see the TODO in RunSubtask.
+func commandArg(args any) string {
+	m, ok := args.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if s, ok := m["command"].(string); ok {
+		return s
+	}
+	return ""
 }
