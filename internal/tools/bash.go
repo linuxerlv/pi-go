@@ -31,7 +31,6 @@ var bashSchema = map[string]any{
 // BashTool executes a shell command and returns its combined output.
 type BashTool struct {
 	BaseTool
-	Cwd string
 }
 
 // NewBashTool constructs a BashTool that runs commands in cwd.
@@ -46,8 +45,8 @@ func NewBashTool(cwd string) *BashTool {
 			ToolLabel:    "Bash",
 			// Shell execution must be sequential to avoid races on the cwd.
 			ToolExecMode: agent.ToolExecutionSequential,
+			Cwd:          cwd,
 		},
-		Cwd: cwd,
 	}
 }
 

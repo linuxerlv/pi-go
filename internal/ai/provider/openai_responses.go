@@ -94,7 +94,9 @@ func (p *OpenAIResponses) runStream(ctx context.Context, model ai.Model, callCtx
 			s := p.client.Responses.NewStreaming(ctx, params.(responses.ResponseNewParams))
 			return newSSEAdapter(s.Next, s.Current, s.Err)
 		},
-		openAIFailureMessage,
+		func(m ai.Model, msg string, aborted bool) ai.AssistantMessage {
+			return makeFailureMessage(m, ai.APIOpenAIResponses, "openai-responses", msg, aborted)
+		},
 	)
 }
 

@@ -25,6 +25,25 @@ type translator interface {
 // failureFn builds an error AssistantMessage for a provider.
 type failureFn func(model ai.Model, msg string, aborted bool) ai.AssistantMessage
 
+// makeFailureMessage builds a failure AssistantMessage for a given provider. It
+// removes the per-provider failureMessage duplication: every provider's failure
+// message is identical except for the API/Provider tags.
+func makeFailureMessage(model ai.Model, api ai.Api, provider, msg string, aborted bool) ai.AssistantMessage {
+	reason := ai.StopError
+	if aborted {
+		reason = ai.StopAborted
+	}
+	return ai.AssistantMessage{
+		Content:      []ai.ContentBlock{ai.TextContent{Type: "text", Text: ""}},
+		API:          api,
+		Provider:     provider,
+		Model:        model.ID,
+		StopReason:   reason,
+		ErrorMessage: msg,
+		Timestamp:    ai.Now(),
+	}
+}
+
 // runStreamCommon is the Template Method: it owns the stream-loop skeleton
 // (params-failure handling, Next iteration, ctx abort, sdkStream.Err, finalize,
 // synthesize DoneEvent) shared by all providers. The variant steps — building

@@ -294,19 +294,7 @@ func mapOpenAIStopReason(s string) ai.StopReason {
 }
 
 func openAIFailureMessage(model ai.Model, msg string, aborted bool) ai.AssistantMessage {
-	reason := ai.StopError
-	if aborted {
-		reason = ai.StopAborted
-	}
-	return ai.AssistantMessage{
-		Content:      []ai.ContentBlock{ai.TextContent{Type: "text", Text: ""}},
-		API:          ai.APIOpenAICompletions,
-		Provider:     "openai",
-		Model:        model.ID,
-		StopReason:   reason,
-		ErrorMessage: msg,
-		Timestamp:    ai.Now(),
-	}
+	return makeFailureMessage(model, ai.APIOpenAICompletions, "openai", msg, aborted)
 }
 
 // buildOpenAIParams converts a pi Context and options into ChatCompletionNewParams.
