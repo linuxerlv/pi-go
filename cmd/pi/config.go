@@ -20,8 +20,8 @@ func defaultConfigPath() string { return filepath.Join(".pi-go", "config.json") 
 
 // userConfigPath returns the user-level config file path.
 // Uses os.UserConfigDir for cross-platform behaviour:
-//   Linux/macOS: ~/.config/pi-go/config.json
-//   Windows:     %LOCALAPPDATA%/pi-go/config.json
+//   Linux/macOS: $XDG_CONFIG_HOME/pi-go/config.json (default ~/.config/pi-go/config.json)
+//   Windows:     %APPDATA%/pi-go/config.json
 func userConfigPath() string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
