@@ -8,6 +8,13 @@
 # Claude Code local settings
 .claude/
 
+# AI agent instruction files (local-only, not shared)
+AGENTS.md
+CLAUDE.md
+
+# Local tooling state
+.omo/
+
 # Go build output
 *.exe
 *.exe~

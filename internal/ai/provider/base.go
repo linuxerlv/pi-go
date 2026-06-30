@@ -2,9 +2,29 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"time"
 
+	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/linuxerlv/pi-go/internal/ai"
+	openai "github.com/openai/openai-go/v3"
 )
+
+// streamRetryConfig tunes the conservative retry policy: only failures that
+// occur before the stream has produced any event are retried, so a retry never
+// produces duplicate/interleaved output. maxRetries is the number of additional
+// attempts (so 2 = up to 3 total calls).
+const (
+	streamMaxRetries = 2
+)
+
+// retryBackoff returns the sleep before the given attempt (0-based): 500ms, 1s.
+func retryBackoff(attempt int) time.Duration {
+	return time.Duration(500<<attempt) * time.Millisecond
+}
 
 // translator is the strategy interface implemented by each provider's stream
 // event translator. baseProvider.runStreamCommon drives the SDK stream loop
@@ -24,6 +44,25 @@ type translator interface {
 
 // failureFn builds an error AssistantMessage for a provider.
 type failureFn func(model ai.Model, msg string, aborted bool) ai.AssistantMessage
+
+// makeFailureMessage builds a failure AssistantMessage for a given provider. It
+// removes the per-provider failureMessage duplication: every provider's failure
+// message is identical except for the API/Provider tags.
+func makeFailureMessage(model ai.Model, api ai.Api, provider, msg string, aborted bool) ai.AssistantMessage {
+	reason := ai.StopError
+	if aborted {
+		reason = ai.StopAborted
+	}
+	return ai.AssistantMessage{
+		Content:      []ai.ContentBlock{ai.TextContent{Type: "text", Text: ""}},
+		API:          api,
+		Provider:     provider,
+		Model:        model.ID,
+		StopReason:   reason,
+		ErrorMessage: msg,
+		Timestamp:    ai.Now(),
+	}
+}
 
 // runStreamCommon is the Template Method: it owns the stream-loop skeleton
 // (params-failure handling, Next iteration, ctx abort, sdkStream.Err, finalize,
@@ -50,28 +89,50 @@ func runStreamCommon(
 ) {
 	params, err := buildParams(model, callCtx, options)
 	if err != nil {
+		// Param-conversion errors are not transient; do not retry.
 		stream.Push(ai.ErrorEvent{Reason: ai.StopError, Error: fail(model, err.Error(), false)})
 		return
 	}
 
-	sdkStream := startStream(ctx, params)
-	tr := newTranslator(model)
-
-	for sdkStream.Next() {
+	// Conservative retry loop: only retry when the stream failed before it
+	// yielded any event (handled == false). Once a single event has been
+	// handled, partial output may already have been emitted to the consumer, so
+	// retrying could interleave/duplicate output — we surface the error
+	// instead. This covers the common transient case (connection refused,
+	// 429, 5xx, DNS) which typically fails at stream establishment.
+	var sdkStream streamSource
+	var tr translator
+	for attempt := 0; ; attempt++ {
+		sdkStream = startStream(ctx, params)
+		tr = newTranslator(model)
+		handled := false
+		for sdkStream.Next() {
+			if ctx.Err() != nil {
+				stream.Push(ai.ErrorEvent{Reason: ai.StopAborted, Error: fail(model, "Operation aborted", true)})
+				return
+			}
+			tr.handle(sdkStream.Current(), stream)
+			handled = true
+		}
+		streamErr := sdkStream.Err()
+		if streamErr == nil {
+			break // clean end; proceed to finalize below.
+		}
+		// ctx cancelled takes precedence over retry.
 		if ctx.Err() != nil {
 			stream.Push(ai.ErrorEvent{Reason: ai.StopAborted, Error: fail(model, "Operation aborted", true)})
 			return
 		}
-		tr.handle(sdkStream.Current(), stream)
-	}
-	if err := sdkStream.Err(); err != nil {
-		reason := ai.StopError
-		aborted := false
-		if ctx.Err() != nil {
-			reason = ai.StopAborted
-			aborted = true
+		if !handled && isRetryable(streamErr) && attempt < streamMaxRetries {
+			select {
+			case <-ctx.Done():
+				stream.Push(ai.ErrorEvent{Reason: ai.StopAborted, Error: fail(model, "Operation aborted", true)})
+				return
+			case <-time.After(retryBackoff(attempt)):
+			}
+			continue // fresh stream + fresh translator
 		}
-		stream.Push(ai.ErrorEvent{Reason: reason, Error: fail(model, err.Error(), aborted)})
+		stream.Push(ai.ErrorEvent{Reason: ai.StopError, Error: fail(model, streamErr.Error(), false)})
 		return
 	}
 	tr.finalize(stream)
@@ -82,6 +143,57 @@ func runStreamCommon(
 		}
 		stream.Push(ai.DoneEvent{Reason: msg.StopReason, Message: msg})
 	}
+}
+
+// isRetryable reports whether a stream error is worth retrying. It recognizes
+// transient network failures and HTTP 429 / 5xx from either SDK's API error
+// type (both expose StatusCode as a field). Non-transient errors (4xx other
+// than 429, auth errors, param errors) are not retried.
+//
+// This is intentionally cross-platform: it avoids syscall errno sentinels
+// (ECONNRESET etc. are Unix-only and absent from syscall on Windows). Gateway
+// connection drops typically surface as io.EOF / io.ErrUnexpectedEOF or a
+// net.Error timeout, both of which are detected below.
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	// SDK API errors carry an HTTP status code.
+	var anthErr *anthropic.Error
+	if errors.As(err, &anthErr) {
+		return retryableStatus(anthErr.StatusCode)
+	}
+	var oaiErr *openai.Error
+	if errors.As(err, &oaiErr) {
+		return retryableStatus(oaiErr.StatusCode)
+	}
+	// Transient network-layer errors: timeouts (covers dial/read/write timeouts
+	// and TLS handshake deadlines).
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	// Gateways/proxies that close the connection mid-stream (before any event)
+	// surface as unexpected EOF. Retry these.
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	// Temporary net operation errors (covers connection refused/reset on the
+	// platforms that surface them via net.OpError.Temporary).
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Temporary() {
+		return true
+	}
+	return false
+}
+
+// retryableStatus classifies an HTTP status as retryable: 429 (rate limit) and
+// 5xx (server errors, including 502/503/504 from gateways).
+func retryableStatus(statusCode int) bool {
+	if statusCode == http.StatusTooManyRequests {
+		return true
+	}
+	return statusCode >= 500 && statusCode < 600
 }
 
 // streamSource is the minimal streaming interface the skeleton depends on.

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/linuxerlv/pi-go/internal/ai"
@@ -80,15 +81,24 @@ func TestOrchestratorSequential(t *testing.T) {
 
 func TestParseSubTasks(t *testing.T) {
 	tests := []struct {
-		input string
-		n     int
+		input   string
+		n       int
+		wantErr bool
 	}{
-		{`[{"id":"1","description":"task one"}]`, 1},
-		{`[{"id":"a","description":"x"},{"id":"b","description":"y"}]`, 2},
-		{`plain text fallback`, 1},
+		{`[{"id":"1","description":"task one"}]`, 1, false},
+		{`[{"id":"a","description":"x"},{"id":"b","description":"y"}]`, 2, false},
+		// A non-JSON response is a malformed plan and must surface an error
+		// rather than silently degrading into a single subtask (defect 3).
+		{`plain text fallback`, 0, true},
 	}
 	for _, tc := range tests {
 		tasks, err := parseSubTasks(tc.input)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("input %q: expected error, got nil (tasks=%v)", tc.input, tasks)
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -114,5 +124,42 @@ func TestOrchestratorParallel(t *testing.T) {
 	}
 	if result.FinalAnswer == "" {
 		t.Fatal("expected non-empty final answer")
+	}
+}
+
+// TestParallelStrategyFailureRecordsPlaceholder verifies that when a subtask
+// fails, its result slot is filled with a failure placeholder instead of being
+// left as a zero-value empty SubTaskResult that synthesis would silently drop.
+func TestParallelStrategyFailureRecordsPlaceholder(t *testing.T) {
+	prov := &mockStreamProvider{}
+	orch := New(Options{
+		Provider: prov,
+		Model:    ai.Model{ID: "mock-model", API: ai.APIAnthropicMessages, Provider: "mock-orch"},
+		Strategy: &ParallelStrategy{MaxConcurrency: 2},
+	})
+	subtasks := []SubTask{
+		{ID: "1", Description: "a"},
+		{ID: "2", Description: "b"},
+	}
+	// Pre-cancel so RunSubtask fails fast (runLoop returns ctx.Err() at the top).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	strat := &ParallelStrategy{MaxConcurrency: 2}
+	results, err := strat.Execute(ctx, subtasks, orch)
+	// Execute returns the first failure as err but still populates results.
+	if err == nil {
+		t.Fatal("expected Execute to return an error when subtasks fail")
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 result slots, got %d", len(results))
+	}
+	for i, r := range results {
+		if r.SubTask.ID != subtasks[i].ID {
+			t.Errorf("result[%d] subtask id = %q, want %q", i, r.SubTask.ID, subtasks[i].ID)
+		}
+		if !strings.Contains(r.Output, "failed") {
+			t.Errorf("result[%d] output %q should contain a failure placeholder", i, r.Output)
+		}
 	}
 }

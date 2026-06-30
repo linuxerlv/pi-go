@@ -184,21 +184,28 @@ func executeToolCallsParallel(
 				defer mu.Unlock()
 				return emit(e)
 			})
-			mu.Lock()
-			defer mu.Unlock()
 			if err != nil {
 				// Execution errors are non-fatal to the loop; encode as error result.
-				finalized[i] = finalizedToolCall{
+				f := finalizedToolCall{
 					toolCall: entry.toolCall,
 					result:   errorToolResult(err.Error()),
 					isError:  true,
 				}
-				emit(ToolExecutionEndEvent{ToolCallID: entry.toolCall.ID, ToolName: entry.toolCall.Name, Result: finalized[i].result, IsError: true})
+				mu.Lock()
+				finalized[i] = f
+				emit(ToolExecutionEndEvent{ToolCallID: f.toolCall.ID, ToolName: f.toolCall.Name, Result: f.result, IsError: true})
+				mu.Unlock()
 				return
 			}
+			// Run the AfterToolCall hook OUTSIDE mu: it is user code that may be
+			// slow or block, and holding mu here would serialize all concurrent
+			// tools. finalize only transforms the result (no emit), so the lock
+			// is not needed for it.
 			f, _ := finalizeExecutedToolCall(ctx, currentContext, assistantMessage, entry.prepared, executedResult, executedIsError, config)
+			mu.Lock()
 			finalized[i] = f
 			emit(ToolExecutionEndEvent{ToolCallID: f.toolCall.ID, ToolName: f.toolCall.Name, Result: f.result, IsError: f.isError})
+			mu.Unlock()
 		}(i, entry)
 	}
 	wg.Wait()

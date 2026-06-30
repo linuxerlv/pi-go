@@ -116,6 +116,17 @@ func Start(ctx context.Context, command string, args []string, env []string) (*C
 			ch <- envelope.Result
 			close(ch)
 		}
+		// stdout closed (server exited/crashed). Fail every pending call so a
+		// caller blocked in `call`'s <-ch receives an error instead of hanging
+		// forever. Mark closed so new calls reject fast.
+		c.mu.Lock()
+		c.closed = true
+		for id, ch := range c.pending {
+			ch <- nil
+			close(ch)
+			delete(c.pending, id)
+		}
+		c.mu.Unlock()
 	}()
 
 	// initialize handshake.
