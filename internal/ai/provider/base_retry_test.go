@@ -59,11 +59,19 @@ func (t *fakeTranslator) terminalEmitted() bool         { return t.terminalFlag 
 
 // runHarness wires up runStreamCommon with fakes and returns the stream plus
 // the per-attempt source list and translator factory for inspection.
-func runRetryTest(t *testing.T, sources []*fakeStreamSource, buildParamsErr error) (ai.AssistantMessageEventStream, *fakeTranslator) {
+//
+// handleEvents/finalizeEvents/terminalFlag are set on the translator BEFORE the
+// producer goroutine starts, so handle() sees them regardless of scheduling
+// (the producer can run before the caller resumes — a race that previously let
+// handle fire with an empty handleEvents slice).
+func runRetryTest(t *testing.T, sources []*fakeStreamSource, buildParamsErr error, handleEvents, finalizeEvents []ai.AssistantMessageEvent, terminalFlag bool) (ai.AssistantMessageEventStream, *fakeTranslator) {
 	t.Helper()
 	stream := ai.NewAssistantMessageEventStream()
 	tr := &fakeTranslator{
-		snapshotMsg: ai.AssistantMessage{Provider: "mock", Model: "m", StopReason: ai.StopStop, Timestamp: ai.Now()},
+		snapshotMsg:    ai.AssistantMessage{Provider: "mock", Model: "m", StopReason: ai.StopStop, Timestamp: ai.Now()},
+		handleEvents:   handleEvents,
+		finalizeEvents: finalizeEvents,
+		terminalFlag:   terminalFlag,
 	}
 	srcIdx := 0
 	startStream := func(ctx context.Context, params any) streamSource {
@@ -117,11 +125,13 @@ func TestRunStreamCommonRetriesUntilSuccess(t *testing.T) {
 		{events: nil, err: io.EOF},                                 // attempt 0: fail before any event
 		{events: []any{"chunk"}, err: nil},                        // attempt 1: success
 	}
-	stream, tr := runRetryTest(t, sources, nil)
-	tr.handleEvents = []ai.AssistantMessageEvent{ai.TextDeltaEvent{Delta: "hi"}}
+	stream, tr := runRetryTest(t, sources, nil,
+		[]ai.AssistantMessageEvent{ai.TextDeltaEvent{Delta: "hi"}}, // handle: emit a delta
+		[]ai.AssistantMessageEvent{ai.DoneEvent{Reason: ai.StopStop, Message: ai.AssistantMessage{Provider: "mock", Model: "m", StopReason: ai.StopStop, Timestamp: ai.Now()}}}, // finalize: emit done
+		true, // terminalEmitted
+	)
 	// finalize emits the terminal done event so terminalEmitted path is covered.
-	tr.finalizeEvents = []ai.AssistantMessageEvent{ai.DoneEvent{Reason: ai.StopStop, Message: tr.snapshotMsg}}
-	tr.terminalFlag = true
+	_ = tr
 
 	final, events := drain(stream)
 	if final.StopReason == ai.StopError {
@@ -145,7 +155,7 @@ func TestRunStreamCommonRetriesExhausted(t *testing.T) {
 		{err: io.EOF},
 		{err: io.EOF},
 	}
-	stream, _ := runRetryTest(t, sources, nil)
+	stream, _ := runRetryTest(t, sources, nil, nil, nil, false)
 	final, _ := drain(stream)
 	if final.StopReason != ai.StopError {
 		t.Fatalf("expected StopError after retries exhausted, got %s", final.StopReason)
@@ -162,8 +172,11 @@ func TestRunStreamCommonNoRetryAfterHandled(t *testing.T) {
 	sources := []*fakeStreamSource{
 		{events: []any{"chunk"}, err: io.EOF}, // handled one event, then errored
 	}
-	stream, tr := runRetryTest(t, sources, nil)
-	tr.handleEvents = []ai.AssistantMessageEvent{ai.TextDeltaEvent{Delta: "partial"}}
+	stream, tr := runRetryTest(t, sources, nil,
+		[]ai.AssistantMessageEvent{ai.TextDeltaEvent{Delta: "partial"}}, // handle: emit one delta
+		nil,   // no finalize on error path
+		false, // not terminal
+	)
 	final, events := drain(stream)
 	if final.StopReason != ai.StopError {
 		t.Fatalf("expected StopError (no retry after handled), got %s", final.StopReason)
@@ -191,7 +204,7 @@ func TestRunStreamCommonNonRetryableErrorNoRetry(t *testing.T) {
 	sources := []*fakeStreamSource{
 		{err: nonRetryable},
 	}
-	stream, _ := runRetryTest(t, sources, nil)
+	stream, _ := runRetryTest(t, sources, nil, nil, nil, false)
 	final, _ := drain(stream)
 	if final.StopReason != ai.StopError {
 		t.Fatalf("expected StopError, got %s", final.StopReason)
@@ -202,7 +215,7 @@ func TestRunStreamCommonNonRetryableErrorNoRetry(t *testing.T) {
 // immediately (not transient), with no stream attempt.
 func TestRunStreamCommonBuildParamsErrorNoRetry(t *testing.T) {
 	// No sources scripted; startStream must never be called.
-	stream, _ := runRetryTest(t, nil, errors.New("bad params"))
+	stream, _ := runRetryTest(t, nil, errors.New("bad params"), nil, nil, false)
 	final, _ := drain(stream)
 	if final.StopReason != ai.StopError {
 		t.Fatalf("expected StopError, got %s", final.StopReason)
