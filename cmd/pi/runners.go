@@ -21,6 +21,7 @@ type deps struct {
 	model        ai.Model
 	prov         ai.Provider
 	tools        []agent.AgentTool
+	toolsFactory func() []agent.AgentTool
 	skills       []harness.Skill
 	templates    []harness.PromptTemplate
 	perm         *permission.Checker
@@ -126,7 +127,7 @@ func (replRunner) Run(d deps) error {
 type orchestrateRunner struct{}
 
 func (orchestrateRunner) Run(d deps) error {
-	runOrchestrator(d.ctx, d.prompt, d.system, d.strategy, d.maxAgents, d.model, d.prov, d.tools, d.verbose)
+	runOrchestrator(d.ctx, d.prompt, d.system, d.strategy, d.maxAgents, d.model, d.prov, d.tools, d.perm, d.toolsFactory, d.verbose)
 	return nil
 }
 

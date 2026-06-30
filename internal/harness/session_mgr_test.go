@@ -153,3 +153,77 @@ func TestSetLabel(t *testing.T) {
 	}
 	t.Fatal("label not persisted/found")
 }
+
+// TestJsonlCrashRecoveryAdoptsOrphan simulates a crash between AppendEntry and
+// SetLeafID: an entry is written to the jsonl file but the meta sidecar still
+// points at the old leaf. On reload the leaf must be reconciled forward so the
+// orphaned message is not lost.
+func TestJsonlCrashRecoveryAdoptsOrphan(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewJsonlStorage(dir, "crash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := NewSession(s)
+	if _, err := sess.AppendMessage(ai.UserMessage{Content: "first", Timestamp: ai.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	leafBefore := derefOrEmpty(sess.GetLeafID())
+
+	// Write an entry parented at the current leaf directly to storage, WITHOUT
+	// advancing the leaf — mirroring a crash right after AppendEntry.
+	parent := leafBefore
+	orphan := MessageEntry{
+		EntryBase: EntryBase{
+			Type: EntryMessage, ID: s.CreateEntryID(), ParentID: &parent, Timestamp: nowISO(),
+		},
+		Message: ai.UserMessage{Content: "orphaned-by-crash", Timestamp: ai.Now()},
+	}
+	if err := s.AppendEntry(orphan); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reload from disk; the meta sidecar still records leafBefore.
+	s2, err := NewJsonlStorage(dir, "crash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess2 := NewSession(s2)
+	if got := derefOrEmpty(sess2.GetLeafID()); got != orphan.ID {
+		t.Fatalf("reconcile should adopt orphaned entry: got leaf %q want %q", got, orphan.ID)
+	}
+	ctx := sess2.BuildContext()
+	var found bool
+	for _, m := range ctx.Messages {
+		if um, ok := m.(ai.UserMessage); ok && um.Content == "orphaned-by-crash" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("orphaned message lost after reload; reconcile failed")
+	}
+}
+
+// TestJsonlReconcileSkipsLabel ensures SetLabel's LabelEntry (parented at the
+// leaf but not advancing it) is NOT adopted by reconcileLeaf on reload.
+func TestJsonlReconcileSkipsLabel(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewSessionManager(dir)
+	sess, err := mgr.Create("labelskip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.AppendMessage(ai.UserMessage{Content: "x", Timestamp: ai.Now()})
+	leafBefore := derefOrEmpty(sess.GetLeafID())
+	if err := sess.SetLabel("a label"); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := NewJsonlStorage(dir, "labelskip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := derefOrEmpty(s2.GetLeafID()); got != leafBefore {
+		t.Fatalf("leaf must stay at the message, not advance to the label: got %q want %q", got, leafBefore)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/linuxerlv/pi-go/internal/agent"
@@ -113,13 +114,41 @@ func (t *EditTool) Execute(ctx context.Context, toolCallID string, params map[st
 		}
 	}
 
-	// Apply edits against the original content sequentially. Since each oldText
-	// is unique, order does not matter and no overlap is possible.
-	for _, e := range edits {
-		content = strings.Replace(content, e.oldText, e.newText, 1)
+	// Apply edits against the ORIGINAL content positionally. Each oldText was
+	// validated to occur exactly once in the original, so strings.Index gives the
+	// unique span. Edits are applied non-incrementally: spans are computed from
+	// the original, overlap is rejected, and splicing happens from the last span
+	// backward so earlier offsets stay valid. (Sequential strings.Replace would
+	// match a later edit's oldText inside an earlier edit's newText.)
+	type span struct{ start, end int; newText string }
+	spans := make([]span, len(edits))
+	for i, e := range edits {
+		idx := strings.Index(content, e.oldText)
+		if idx < 0 {
+			// Should not happen (validate checked Count==1), but guard anyway.
+			return agent.AgentToolResult{}, fmt.Errorf("edits[%d].oldText not found in file", i)
+		}
+		spans[i] = span{start: idx, end: idx + len(e.oldText), newText: e.newText}
+	}
+	// Reject overlapping spans (adjacent is allowed).
+	for i := 0; i < len(spans); i++ {
+		for j := i + 1; j < len(spans); j++ {
+			if spans[i].start < spans[j].end && spans[j].start < spans[i].end {
+				return agent.AgentToolResult{
+					Content: []ai.ContentBlock{ai.TextContent{Type: "text", Text: fmt.Sprintf("Edits %d and %d overlap in %s", i, j, path)}},
+					Details: map[string]any{"path": path, "reason": "overlap"},
+				}, fmt.Errorf("edits %d and %d overlap", i, j)
+			}
+		}
+	}
+	// Splice from the last span backward so earlier offsets remain valid.
+	out := content
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start > spans[j].start })
+	for _, s := range spans {
+		out = out[:s.start] + s.newText + out[s.end:]
 	}
 
-	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(abs, []byte(out), 0o644); err != nil {
 		return agent.AgentToolResult{}, err
 	}
 

@@ -56,15 +56,8 @@ func (b BaseTool) resolvePath(path string) string {
 	return filepath.Join(b.Cwd, path)
 }
 
-// textResult builds a successful AgentToolResult from a single text block.
-// Shared by tools whose result is primarily text.
-func textResult(text string) agent.AgentToolResult {
-	return agent.AgentToolResult{
-		Content: []ai.ContentBlock{ai.TextContent{Type: "text", Text: text}},
-	}
-}
-
-// textResultWithDetails is like textResult but attaches structured details.
+// textResultWithDetails builds a successful AgentToolResult from a single text
+// block plus structured details. Shared by tools whose result is text + details.
 func textResultWithDetails(text string, details any) agent.AgentToolResult {
 	return agent.AgentToolResult{
 		Content: []ai.ContentBlock{ai.TextContent{Type: "text", Text: text}},

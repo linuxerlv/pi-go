@@ -22,7 +22,7 @@ import (
 
 func main() {
 	loadDotEnv(".env")
-	cfg := loadConfig(defaultConfigPath())
+	cfg := loadMergedConfig()
 
 	prompt := flag.String("prompt", "", "Prompt to send to the model")
 	modelID := flag.String("model", cfg.Model, "Model id (default depends on provider or config)")
@@ -65,14 +65,7 @@ func main() {
 	}
 
 	cwd, _ := os.Getwd()
-	agentTools := []agent.AgentTool{
-		tools.NewReadTool(cwd),
-		tools.NewBashTool(cwd),
-		tools.NewWriteTool(cwd),
-		tools.NewEditTool(cwd),
-		tools.NewGrepTool(cwd),
-		tools.NewGlobTool(cwd),
-	}
+	var mcpTools []agent.AgentTool
 
 	// Load optional skills and prompt templates.
 	var skills []harness.Skill
@@ -88,13 +81,24 @@ func main() {
 	defer cancel()
 
 	// Launch optional MCP server(s) and register their tools.
+	var mcpClients []*mcp.Client
 	if *mcpServers != "" {
-		mcpTools, err := loadMCPTools(ctx, *mcpServers)
+		mt, client, err := loadMCPTools(ctx, *mcpServers)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[mcp warning: %v]\n", err)
 		}
-		agentTools = append(agentTools, mcpTools...)
+		mcpTools = append(mcpTools, mt...)
+		if client != nil {
+			mcpClients = append(mcpClients, client)
+		}
 	}
+	// Ensure MCP child processes are killed on exit; ctx cancellation alone does
+	// not terminate them (the MCP client kills the server in Close).
+	defer func() {
+		for _, c := range mcpClients {
+			c.Close()
+		}
+	}()
 
 	// Build the permission checker when --permission is set.
 	var perm *permission.Checker
@@ -107,12 +111,19 @@ func main() {
 		})
 	}
 
+	// Assemble the tool set for the single-agent paths. The orchestrator gets a
+	// ToolFactory instead (below) so each parallel subagent can run with its own
+	// tool instances; built-in tools are stateless so this is an isolation
+	// extension point rather than a correctness fix.
+	agentTools := buildAgentTools(cwd, mcpTools)
+
 	// Assemble the shared deps and dispatch to the selected run mode.
 	d := deps{
 		ctx:         ctx,
 		model:       model,
 		prov:        prov,
 		tools:       agentTools,
+		toolsFactory: func() []agent.AgentTool { return buildAgentTools(cwd, mcpTools) },
 		skills:      skills,
 		templates:   templates,
 		perm:        perm,
@@ -170,8 +181,26 @@ func runHarness(ctx context.Context, sessionID, prompt, system string, model ai.
 	fmt.Fprintln(os.Stderr)
 }
 
+// buildAgentTools constructs the built-in tool set (read/bash/write/edit/grep/
+// glob) plus any MCP tools, all bound to cwd. The built-in tools are stateless,
+// so constructing fresh instances per call (as the orchestrator's ToolFactory
+// does) is safe and isolates future stateful tools per subagent. MCP tools
+// share the underlying *mcp.Client (whose call() is concurrency-safe).
+func buildAgentTools(cwd string, mcpTools []agent.AgentTool) []agent.AgentTool {
+	toolsSlice := []agent.AgentTool{
+		tools.NewReadTool(cwd),
+		tools.NewBashTool(cwd),
+		tools.NewWriteTool(cwd),
+		tools.NewEditTool(cwd),
+		tools.NewGrepTool(cwd),
+		tools.NewGlobTool(cwd),
+	}
+	toolsSlice = append(toolsSlice, mcpTools...)
+	return toolsSlice
+}
+
 // runOrchestrator runs the prompt through the multi-agent orchestrator.
-func runOrchestrator(ctx context.Context, prompt, system, strategyName string, maxAgents int, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, verbose bool) {
+func runOrchestrator(ctx context.Context, prompt, system, strategyName string, maxAgents int, model ai.Model, prov ai.Provider, agentTools []agent.AgentTool, perm *permission.Checker, toolFactory func() []agent.AgentTool, verbose bool) {
 	var strat orchestrator.Strategy
 	switch strategyName {
 	case "parallel":
@@ -186,6 +215,8 @@ func runOrchestrator(ctx context.Context, prompt, system, strategyName string, m
 		SystemPrompt: system,
 		Tools:        agentTools,
 		Strategy:     strat,
+		Permission:   perm,
+		ToolFactory:  toolFactory,
 	})
 
 	fmt.Fprintf(os.Stderr, "[orchestrator] planning subtasks...\n")
@@ -210,29 +241,30 @@ func runOrchestrator(ctx context.Context, prompt, system, strategyName string, m
 	fmt.Fprintf(os.Stderr, "\nFinal Answer:\n%s\n", result.FinalAnswer)
 }
 
-// loadMCPTools launches an MCP server (quoted string) and returns its tools.
-func loadMCPTools(ctx context.Context, command string) ([]agent.AgentTool, error) {
+// loadMCPTools launches an MCP server (quoted string) and returns its tools
+// plus the client (caller must Close it to reap the child process).
+func loadMCPTools(ctx context.Context, command string) ([]agent.AgentTool, *mcp.Client, error) {
 	parts, err := splitShellArgs(command)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(parts) == 0 {
-		return nil, fmt.Errorf("empty mcp command")
+		return nil, nil, fmt.Errorf("empty mcp command")
 	}
 	client, err := mcp.Start(ctx, parts[0], parts[1:], nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defs, err := client.ListTools(ctx)
 	if err != nil {
 		client.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	var out []agent.AgentTool
 	for _, d := range defs {
 		out = append(out, mcp.NewMCPTool(client, d))
 	}
-	return out, nil
+	return out, client, nil
 }
 
 // splitShellArgs splits a command string on whitespace, honoring double quotes.

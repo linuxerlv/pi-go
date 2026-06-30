@@ -247,18 +247,21 @@ func (t *anthropicTranslator) handle(event any, stream ai.AssistantMessageEventS
 			}
 		case "input_json_delta":
 			if tc, ok := t.blocks[idx].(ai.ToolCall); ok {
-				// If the start event carried a placeholder input (common when
-				// the real args arrive via deltas), drop it now that real
-				// deltas are streaming in.
+				// Some gateways send the full input object on content_block_start
+				// (captured into ArgumentsRaw/Arguments when len>0) instead of
+				// streaming it via deltas. If start already gave real, complete args,
+				// treat start as authoritative and ignore subsequent deltas: sending
+				// both is malformed, and reassembling from fragments would discard
+				// start's args (the bug). Standard protocol sends an empty {} here.
 				if len(tc.ArgumentsRaw) > 0 && len(tc.Arguments) > 0 && !t.deltaSeen[idx] {
-					tc.ArgumentsRaw = nil
-					tc.Arguments = nil
+					t.deltaSeen[idx] = true
+				} else {
+					t.deltaSeen[idx] = true
+					tc.ArgumentsRaw = append(tc.ArgumentsRaw, []byte(d.PartialJSON)...)
+					t.blocks[idx] = tc
+					t.partial.Content = t.blocks
+					stream.Push(ai.ToolCallDeltaEvent{ContentIndex: idx, Delta: d.PartialJSON, Partial: t.snapshot()})
 				}
-				t.deltaSeen[idx] = true
-				tc.ArgumentsRaw = append(tc.ArgumentsRaw, []byte(d.PartialJSON)...)
-				t.blocks[idx] = tc
-				t.partial.Content = t.blocks
-				stream.Push(ai.ToolCallDeltaEvent{ContentIndex: idx, Delta: d.PartialJSON, Partial: t.snapshot()})
 			}
 		}
 
@@ -353,19 +356,7 @@ func mapStopReason(s string) ai.StopReason {
 }
 
 func failureMessage(model ai.Model, msg string, aborted bool) ai.AssistantMessage {
-	reason := ai.StopError
-	if aborted {
-		reason = ai.StopAborted
-	}
-	return ai.AssistantMessage{
-		Content:      []ai.ContentBlock{ai.TextContent{Type: "text", Text: ""}},
-		API:          ai.APIAnthropicMessages,
-		Provider:     "anthropic",
-		Model:        model.ID,
-		StopReason:   reason,
-		ErrorMessage: msg,
-		Timestamp:    ai.Now(),
-	}
+	return makeFailureMessage(model, ai.APIAnthropicMessages, "anthropic", msg, aborted)
 }
 
 // buildAnthropicParams converts a pi Context and options into an Anthropic

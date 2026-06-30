@@ -93,22 +93,89 @@ func (s *JsonlStorage) load() error {
 		}
 	}
 	// If no leaf was recorded (e.g. an imported jsonl without a meta sidecar),
-	// default the leaf to the last appended entry so the branch is visible.
+	// default the leaf to the last appended branch-extending entry so the branch
+	// is visible. Skip Label/Leaf metadata entries (they don't extend a branch).
 	if s.leafID == nil && len(s.order) > 0 {
-		last := s.order[len(s.order)-1]
-		s.leafID = &last
+		for i := len(s.order) - 1; i >= 0; i-- {
+			if e, ok := s.entries[s.order[i]]; ok && branchExtending(e) {
+				last := s.order[i]
+				s.leafID = &last
+				break
+			}
+		}
 	}
+	// Reconcile the leaf forward through any orphaned linear continuations: an
+	// entry may have been written to the jsonl file just before a crash between
+	// AppendEntry and SetLeafID, leaving it parented at the stale leaf. Adopt
+	// such entries so the message is not lost on reload.
+	s.reconcileLeaf()
 	return scanner.Err()
 }
 
-// persistMeta writes the sidecar metadata file.
+// reconcileLeaf advances the leaf forward through orphaned branch-extending
+// children: entries whose ParentID equals the current leaf. This recovers
+// entries written to disk but never made the leaf via SetLeafID (crash window).
+// The LAST matching child is selected (forks in this codebase start from the
+// tip, so there is at most one child); Label/Leaf metadata entries are skipped
+// because SetLabel deliberately does not advance the leaf.
+func (s *JsonlStorage) reconcileLeaf() {
+	if s.leafID == nil {
+		return
+	}
+	cur := *s.leafID
+	for {
+		next := ""
+		for _, id := range s.order {
+			e, ok := s.entries[id]
+			if !ok {
+				continue
+			}
+			pid := e.Base().ParentID
+			if pid == nil || *pid != cur {
+				continue
+			}
+			if !branchExtending(e) {
+				continue
+			}
+			next = id // last match wins
+		}
+		if next == "" {
+			return
+		}
+		cur = next
+		s.leafID = &cur
+	}
+}
+
+// branchExtending reports whether an entry extends the active branch (advances
+// the leaf). Label and Leaf entries are metadata that attach to a leaf without
+// extending the branch.
+func branchExtending(e Entry) bool {
+	switch e.(type) {
+	case LabelEntry, LeafEntry:
+		return false
+	}
+	return true
+}
+
+// persistMeta writes the sidecar metadata file atomically: it writes to a
+// temp file in the same directory and renames it into place, so a crash mid-write
+// never leaves a half-written sidecar (os.WriteFile truncates-then-writes).
 func (s *JsonlStorage) persistMeta() error {
 	mf := jsonlMetaFile{Session: s.meta, LeafID: s.leafID}
 	b, err := json.MarshalIndent(mf, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.metaPath(), b, 0o644)
+	tmp := s.metaPath() + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.metaPath()); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // Metadata returns session metadata.

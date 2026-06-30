@@ -2,8 +2,9 @@ package agent
 
 import (
 	"context"
-	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/linuxerlv/pi-go/internal/ai"
 )
@@ -36,11 +37,6 @@ func (t *fakeTool) Execute(ctx context.Context, id string, params map[string]any
 	return t.result, t.err
 }
 func (t *fakeTool) ExecutionMode() ToolExecutionMode { return "" }
-
-func collectEvents(emit func(AgentEvent) error) []AgentEvent {
-	// Helper unused; tests inline event collection.
-	return nil
-}
 
 func TestRunAgentLoopSingleTextTurn(t *testing.T) {
 	prov := newMockProvider(scriptTextTurn("hello"))
@@ -197,5 +193,70 @@ func TestRunAgentLoopBeforeToolCallBlock(t *testing.T) {
 	}
 }
 
-// Ensure unused import guard.
-var _ = strings.TrimSpace
+// TestParallelAfterToolCallNotSerialized verifies that the AfterToolCall hook
+// runs concurrently across tools in a parallel batch. Previously the hook was
+// invoked under the batch mutex, serializing all tools. We measure max in-flight
+// concurrency of the hook; with the fix it reaches 2.
+func TestParallelAfterToolCallNotSerialized(t *testing.T) {
+	toolA := &fakeTool{name: "a", result: AgentToolResult{
+		Content: []ai.ContentBlock{ai.TextContent{Type: "text", Text: "a"}},
+	}}
+	toolB := &fakeTool{name: "b", result: AgentToolResult{
+		Content: []ai.ContentBlock{ai.TextContent{Type: "text", Text: "b"}},
+	}}
+
+	// Script one turn emitting two tool calls, then a final text turn.
+	tcA := ai.ToolCall{Type: "toolCall", ID: "c1", Name: "a", Arguments: map[string]any{"x": "1"}, ArgumentsRaw: []byte(`{"x":"1"}`)}
+	tcB := ai.ToolCall{Type: "toolCall", ID: "c2", Name: "b", Arguments: map[string]any{"x": "1"}, ArgumentsRaw: []byte(`{"x":"1"}`)}
+	toolMsg := ai.AssistantMessage{
+		Content:    []ai.ContentBlock{tcA, tcB},
+		API:        ai.APIAnthropicMessages, Provider: "mock", Model: "mock-model",
+		StopReason: ai.StopToolUse, Timestamp: ai.Now(),
+	}
+	toolTurn := []ai.AssistantMessageEvent{
+		ai.StartEvent{Partial: toolMsg},
+		ai.ToolCallStartEvent{ContentIndex: 0, Partial: toolMsg},
+		ai.ToolCallEndEvent{ContentIndex: 0, ToolCall: tcA, Partial: toolMsg},
+		ai.ToolCallStartEvent{ContentIndex: 1, Partial: toolMsg},
+		ai.ToolCallEndEvent{ContentIndex: 1, ToolCall: tcB, Partial: toolMsg},
+		ai.DoneEvent{Reason: ai.StopToolUse, Message: toolMsg},
+	}
+	prov := newMockProvider(toolTurn, scriptTextTurn("done"))
+
+	var inFlight, maxInFlight int32
+	afterFn := func(ctx context.Context, c AfterToolCallContext) (*AfterToolCallResult, error) {
+		n := atomic.AddInt32(&inFlight, 1)
+		for {
+			m := atomic.LoadInt32(&maxInFlight)
+			if n <= m {
+				break
+			}
+			if atomic.CompareAndSwapInt32(&maxInFlight, m, n) {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond) // widen the overlap window
+		atomic.AddInt32(&inFlight, -1)
+		return nil, nil
+	}
+
+	config := NewLoopConfig(ai.Model{ID: "mock-model"}).
+		WithConvertToLlm(DefaultConvertToLlm).
+		WithPermission(nil, afterFn).
+		Build()
+
+	ctx := AgentContext{SystemPrompt: "sys", Tools: []AgentTool{toolA, toolB}}
+	_, err := RunAgentLoop(context.Background(),
+		[]AgentMessage{ai.UserMessage{Content: "do both", Timestamp: ai.Now()}},
+		ctx, config, prov,
+		func(AgentEvent) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Both AfterToolCall hooks must have overlapped. If they ran serialized
+	// (the bug), maxInFlight stays at 1.
+	if got := atomic.LoadInt32(&maxInFlight); got < 2 {
+		t.Fatalf("AfterToolCall should run concurrently; max in-flight=%d want >=2", got)
+	}
+}
